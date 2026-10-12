@@ -1,4 +1,5 @@
 import { createInterface } from "node:readline"
+import { stdin } from "node:process"
 import { execFileSync, spawn } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import * as path from "node:path"
@@ -1642,17 +1643,13 @@ function dispatchAppEvent(ev: Ev): bool {
 // In a packaged .app the bundle executable is a helper in host mode: it
 // owns NSApplication and forwards app-level events (deep links, document
 // opens) as JSON lines to this process's stdin, flagging the layout with
-// MYTOV_HOST. Tov exposes no stdin stream, so the pipe is bounced through
-// `cat` — cat inherits our stdin and its stdout is a stream readline can
-// consume, the same channel shape windows use.
+// MYTOV_HOST.
 let hostChannelStarted = false
 
 function startHostChannel() throws Error | JsError {
   if (hostChannelStarted || process.env.MYTOV_HOST === undefined) return
   hostChannelStarted = true
-  const args: string[] = []
-  const cat = try spawn("cat", args, { stdio: ["inherit", "pipe", "inherit"] })
-  const rl = try createInterface({ input: cat.stdout })
+  const rl = try createInterface({ input: stdin })
   try rl.on("line", (line: Js) => {
     try {
       const ev = try JSON.parse(line as string) as Ev
