@@ -296,11 +296,23 @@ static ListView *gView;
   snprintf(buf, sizeof(buf), "{\\"event\\":\\"mousedown\\",\\"x\\":%g,\\"y\\":%g}", p.x, p.y);
   emit(buf);
 }
+- (void)emitGeometry {
+  NSSize size = self.bounds.size;
+  double scale = self.window ? self.window.backingScaleFactor : 1.0;
+  emitJSON(@{ @"event": @"resize", @"w": @(size.width), @"h": @(size.height), @"scale": @(scale) });
+}
 - (void)setFrameSize:(NSSize)size {
   [super setFrameSize:size];
-  char buf[128];
-  snprintf(buf, sizeof(buf), "{\\"event\\":\\"resize\\",\\"w\\":%g,\\"h\\":%g}", size.width, size.height);
-  emit(buf);
+  [self emitGeometry];
+  [self setNeedsDisplay:YES];
+}
+- (void)viewDidMoveToWindow {
+  [super viewDidMoveToWindow];
+  [self emitGeometry];
+}
+- (void)viewDidChangeBackingProperties {
+  [super viewDidChangeBackingProperties];
+  [self emitGeometry];
   [self setNeedsDisplay:YES];
 }
 @end
@@ -379,6 +391,10 @@ int main(int argc, const char *argv[]) {
 
     [win makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+    // The Tov side may attach its line reader after the first setFrameSize;
+    // re-announce geometry once the run loop is up.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [gView emitGeometry]; });
     [NSApp run];
   }
   return 0;
@@ -402,10 +418,14 @@ function helperPath(): string {
 
 export type AppOptions = { title?: string, width?: int, height?: int, view: () => View }
 
-type Ev = { event: string, x?: f64, y?: f64, w?: f64, h?: f64, id?: int }
+type Ev = { event: string, x?: f64, y?: f64, w?: f64, h?: f64, id?: int, scale?: f64 }
 
 let winW = 480.0
 let winH = 360.0
+// Points, not pixels: every coordinate and text size is in points, and the
+// helper draws vectorially, so Retina output is automatic. winScale is the
+// window's backing factor, kept for when a view needs pixel alignment.
+let winScale = 1.0
 let lastFrame = ""
 let lastHits: Hit[] = []
 let stdin: Js | undefined = undefined
@@ -424,7 +444,9 @@ export function run(opts: AppOptions) throws Error | JsError {
   stdin = child.stdin
 
   const rl = try createInterface({ input: child.stdout })
+  const debug = process.env.MYTOV_DEBUG !== undefined
   try rl.on("line", (line: Js) => {
+    if (debug) console.log(`window> ${line as string}`)
     try {
       const ev = try JSON.parse(line as string) as Ev
       if (ev.event === "mousedown" && ev.x !== undefined && ev.y !== undefined) {
@@ -440,6 +462,7 @@ export function run(opts: AppOptions) throws Error | JsError {
       } else if (ev.event === "resize" && ev.w !== undefined && ev.h !== undefined) {
         winW = ev.w
         winH = ev.h
+        winScale = ev.scale ?? 1.0
         render(view)
       } else if (ev.event === "measured" && ev.id !== undefined && ev.w !== undefined && ev.h !== undefined) {
         const key = measureKeys.get(ev.id)
