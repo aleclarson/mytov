@@ -24,6 +24,10 @@ export type Handlers = {
   hover?: (hovering: bool) => void,
   scroll?: (dx: f64, dy: f64) => void,
   key?: (e: KeyEv) => void,
+  // Editing channel for text widgets: "insert" committed text,
+  // "command" an editing selector name (e.g. moveLeft, deleteBackward),
+  // "marked" IME preedit text, "paste" a clipboard reply.
+  text?: (op: string, s: string) => void,
   focusable?: bool,
 }
 
@@ -35,6 +39,10 @@ export type View =
   | { kind: "column", gap: f64, children: View[] }
   | { kind: "row", gap: f64, children: View[] }
   | { kind: "pad", inset: f64, child: View }
+  | { kind: "scroll", st: ScrollState, child: View }
+  | { kind: "split", st: SplitState, left: View, right: View }
+  | { kind: "bg", color: string, child: View }
+  | { kind: "list", st: ScrollState, count: int, rowH: f64, row: (i: int) => View }
   | { kind: "spacer" }
 
 export type TextOpts = { size?: f64, bold?: bool, color?: string }
@@ -63,6 +71,42 @@ export function spacer(): View {
   return { kind: "spacer" }
 }
 
+// Mutable scroll offset for scroll()/list(); held by the app.
+export class ScrollState {
+  offset = 0.0
+  max = 0.0 // content minus viewport, refreshed each layout pass
+
+  scrollBy(dy: f64) {
+    this.offset = Math.max(0.0, Math.min(this.max, this.offset + dy))
+  }
+}
+
+// Child laid out inside a clipped viewport, scrolled by st.offset. The view
+// fills its share of the parent like a spacer, but keeps its contents.
+export function scroll(child: View, st: ScrollState): View {
+  return { kind: "scroll", st, child }
+}
+
+// Split position 0..1 for split(); held by the app, dragged by the divider.
+export class SplitState {
+  fraction = 0.5
+}
+
+// Draggable two-pane row: left pane gets fraction of the width.
+export function split(left: View, right: View, st: SplitState): View {
+  return { kind: "split", st, left, right }
+}
+
+// Fills its box with a solid color behind the child.
+export function bg(color: string, child: View): View {
+  return { kind: "bg", color, child }
+}
+
+// Virtualized rows: only the visible slice is laid out per frame.
+export function list(count: int, rowH: f64, row: (i: int) => View, st: ScrollState): View {
+  return { kind: "list", st, count, rowH, row }
+}
+
 // Attach event handlers to a view's region. Handlers on an inner view win
 // over an `on` wrapper's where they overlap (inner is more specific).
 export function on(child: View, handlers: Handlers): View {
@@ -73,12 +117,14 @@ export function on(child: View, handlers: Handlers): View {
 
 export type Size = { w: f64, h: f64 }
 export type Box = { x: f64, y: f64, w: f64, h: f64 }
-export type Hit = { box: Box, on: Handlers }
+export type Hit = { box: Box, on: Handlers, clip?: Box }
 
 export type Cmd =
   | { kind: "rect", x: f64, y: f64, w: f64, h: f64, color: string, radius: f64, stroke: string, lw: f64 }
   | { kind: "oval", x: f64, y: f64, w: f64, h: f64, color: string }
   | { kind: "text", x: f64, y: f64, w: f64, h: f64, s: string, size: f64, color: string, bold: bool }
+  | { kind: "pushClip", x: f64, y: f64, w: f64, h: f64 }
+  | { kind: "popClip" }
 export type Frame = { frame: Cmd[] }
 
 // Text metrics. The render pass pre-measures every run through the helper
@@ -126,7 +172,16 @@ function collectRuns(v: View, inout out: TextRun[], inout seen: Set<string>) {
     case "events":
       collectRuns(v.child, &out, &seen)
       break
+    case "scroll":
+    case "bg":
+      collectRuns(v.child, &out, &seen)
+      break
+    case "split":
+      collectRuns(v.left, &out, &seen)
+      collectRuns(v.right, &out, &seen)
+      break
     case "custom":
+    case "list":
       break
     case "column":
     case "row":
@@ -153,6 +208,12 @@ export function measure(v: View): Size {
       return measure(v.child)
     case "custom":
       return { w: v.w, h: v.h }
+    case "scroll":
+    case "list":
+    case "split":
+      return { w: 0, h: 0 }
+    case "bg":
+      return measure(v.child)
     case "column": {
       let w = 0
       let h = v.gap * (v.children.length - 1)
@@ -187,10 +248,20 @@ export type WidgetState = { hover: bool, pressed: bool, focused: bool }
 
 const NO_HIT: Styles = { hover: -1, pressed: -1, focus: -1 }
 
+// spacers, scroll views and lists all expand to fill leftover space.
+function isFlex(v: View): bool {
+  return v.kind === "spacer" || v.kind === "scroll" || v.kind === "list" || v.kind === "split" || v.kind === "bg"
+}
+
 // Lays `v` out inside `box`. Rows and columns center their stack on the
 // main axis and each child on the cross axis; spacers split leftover
 // space evenly.
-export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[], st?: Styles) {
+function tagClip(h: Hit, clip?: Box): Hit {
+  if (clip === undefined) return h
+  return { box: h.box, on: h.on, clip }
+}
+
+export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[], st?: Styles, clip?: Box) {
   const style = st ?? NO_HIT
   switch (v.kind) {
     case "text":
@@ -205,29 +276,87 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[], s
       }
       const th = textSize(v.title, 15.0, true).h
       cmds.push({ kind: "text", x: box.x, y: box.y + (box.h - th) / 2, w: box.w, h: th, s: v.title, size: 15.0, color: "#ffffff", bold: true })
-      hits.push({ box, on: { click: v.onClick, focusable: true } })
+      hits.push(tagClip({ box, on: { click: v.onClick, focusable: true } }, clip))
       break
     }
     case "events":
       // Register the wrapper's region before placing the child so the
       // child's own regions come later in the list and win hit-testing.
-      hits.push({ box, on: v.on })
-      place(v.child, box, &cmds, &hits, st)
+      hits.push(tagClip({ box, on: v.on }, clip))
+      place(v.child, box, &cmds, &hits, st, clip)
       break
     case "custom": {
       const idx = hits.length
       const ws: WidgetState = { hover: style.hover === idx, pressed: style.pressed === idx, focused: style.focus === idx }
       const regions = v.regions
       if (regions !== undefined) {
-        for (const h of regions(box)) hits.push(h)
+        for (const h of regions(box)) hits.push(tagClip(h, clip))
       } else if (v.on !== undefined) {
-        hits.push({ box, on: v.on! })
+        hits.push(tagClip({ box, on: v.on! }, clip))
       }
       for (const c of v.paint(box, ws)) cmds.push(c)
       break
     }
+    case "scroll": {
+      const stt = v.st
+      const contentH = measure(v.child).h
+      stt.max = Math.max(0.0, contentH - box.h)
+      stt.offset = Math.max(0.0, Math.min(stt.max, stt.offset))
+      hits.push(tagClip({ box, on: { scroll: (dx, dy) => stt.scrollBy(dy) } }, clip))
+      cmds.push({ kind: "pushClip", x: box.x, y: box.y, w: box.w, h: box.h })
+      place(v.child, { x: box.x, y: box.y - stt.offset, w: box.w, h: contentH }, &cmds, &hits, st, box)
+      if (stt.max > 0) {
+        // scrollbar thumb, right edge
+        const frac = box.h / contentH
+        const th = Math.max(24.0, box.h * frac)
+        const ty = box.y + (box.h - th) * (stt.offset / stt.max)
+        cmds.push({ kind: "rect", x: box.x + box.w - 4.0, y: ty, w: 3.0, h: th, color: "#00000033", radius: 1.5, stroke: "", lw: 0.0 })
+      }
+      cmds.push({ kind: "popClip" })
+      break
+    }
+    case "list": {
+      const stt = v.st
+      const contentH = v.count * v.rowH
+      stt.max = Math.max(0.0, contentH - box.h)
+      stt.offset = Math.max(0.0, Math.min(stt.max, stt.offset))
+      hits.push(tagClip({ box, on: { scroll: (dx, dy) => stt.scrollBy(dy) } }, clip))
+      cmds.push({ kind: "pushClip", x: box.x, y: box.y, w: box.w, h: box.h })
+      const first = Math.max(0, Math.trunc(stt.offset / v.rowH))
+      const last = Math.min(v.count, Math.trunc((stt.offset + box.h) / v.rowH) + 1)
+      for (let i = first; i < last; i += 1) {
+        place(v.row(i), { x: box.x, y: box.y + i * v.rowH - stt.offset, w: box.w, h: v.rowH }, &cmds, &hits, st, box)
+      }
+      if (stt.max > 0) {
+        const frac = box.h / contentH
+        const th = Math.max(24.0, box.h * frac)
+        const ty = box.y + (box.h - th) * (stt.offset / stt.max)
+        cmds.push({ kind: "rect", x: box.x + box.w - 4.0, y: ty, w: 3.0, h: th, color: "#00000033", radius: 1.5, stroke: "", lw: 0.0 })
+      }
+      cmds.push({ kind: "popClip" })
+      break
+    }
+    case "split": {
+      // fraction of the width for the left pane; 6pt divider between.
+      const stt = v.st
+      const lw = Math.max(0.0, (box.w - 6.0) * Math.max(0.0, Math.min(1.0, stt.fraction)))
+      const div: Box = { x: box.x + lw, y: box.y, w: 6.0, h: box.h }
+      place(v.left, { x: box.x, y: box.y, w: lw, h: box.h }, &cmds, &hits, st, clip)
+      place(v.right, { x: box.x + lw + 6.0, y: box.y, w: box.w - lw - 6.0, h: box.h }, &cmds, &hits, st, clip)
+      const di = hits.length
+      hits.push(tagClip({ box: div, on: {
+        press: () => {},
+        drag: (x) => { stt.fraction = Math.max(0.0, Math.min(1.0, (x - box.x) / box.w)) },
+      } }, clip))
+      cmds.push({ kind: "rect", x: div.x + 2.5, y: div.y, w: 1.0, h: div.h, color: style.hover === di || style.pressed === di ? "#0a7aff" : "#d1d1d6", radius: 0.0, stroke: "", lw: 0.0 })
+      break
+    }
+    case "bg":
+      cmds.push({ kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: v.color, radius: 0.0, stroke: "", lw: 0.0 })
+      place(v.child, box, &cmds, &hits, st, clip)
+      break
     case "pad":
-      place(v.child, { x: box.x + v.inset, y: box.y + v.inset, w: box.w - v.inset * 2, h: box.h - v.inset * 2 }, &cmds, &hits, st)
+      place(v.child, { x: box.x + v.inset, y: box.y + v.inset, w: box.w - v.inset * 2, h: box.h - v.inset * 2 }, &cmds, &hits, st, clip)
       break
     case "spacer":
       break
@@ -238,7 +367,7 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[], s
       let j = 0
       for (const c of v.children) {
         fixed += sizes[j]!.h
-        if (c.kind === "spacer") spacers += 1
+        if (isFlex(c)) spacers += 1
         j += 1
       }
       const extra = Math.max(0, box.h - fixed)
@@ -247,9 +376,10 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[], s
       let i = 0
       for (const c of v.children) {
         const s = sizes[i]!
-        const h = c.kind === "spacer" ? perSpacer : s.h
-        const w = Math.min(s.w, box.w)
-        place(c, { x: box.x + (box.w - w) / 2, y, w, h }, &cmds, &hits, st)
+        const flex = isFlex(c)
+        const h = flex ? perSpacer : s.h
+        const w = flex ? box.w : Math.min(s.w, box.w)
+        place(c, { x: flex ? box.x : box.x + (box.w - w) / 2, y, w, h }, &cmds, &hits, st, clip)
         y += h + v.gap
         i += 1
       }
@@ -262,7 +392,7 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[], s
       let j = 0
       for (const c of v.children) {
         fixed += sizes[j]!.w
-        if (c.kind === "spacer") spacers += 1
+        if (isFlex(c)) spacers += 1
         j += 1
       }
       const extra = Math.max(0, box.w - fixed)
@@ -271,9 +401,10 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[], s
       let i = 0
       for (const c of v.children) {
         const s = sizes[i]!
-        const w = c.kind === "spacer" ? perSpacer : s.w
+        const flex = isFlex(c)
+        const w = flex ? perSpacer : s.w
         const h = Math.min(s.h, box.h)
-        place(c, { x, y: box.y + (box.h - h) / 2, w, h }, &cmds, &hits, st)
+        place(c, { x, y: box.y + (box.h - h) / 2, w, h }, &cmds, &hits, st, clip)
         x += w + v.gap
         i += 1
       }
@@ -356,6 +487,13 @@ static ListView *gView;
         [path stroke];
       }
     }
+    if ([kind isEqualToString:@"pushClip"]) {
+      [NSGraphicsContext saveGraphicsState];
+      NSRectClip(NSMakeRect(num(cmd, @"x"), num(cmd, @"y"), num(cmd, @"w"), num(cmd, @"h")));
+    }
+    if ([kind isEqualToString:@"popClip"]) {
+      [NSGraphicsContext restoreGraphicsState];
+    }
     if ([kind isEqualToString:@"oval"]) {
       NSRect box = NSMakeRect(num(cmd, @"x"), num(cmd, @"y"), num(cmd, @"w"), num(cmd, @"h"));
       [color(cmd[@"color"]) setFill];
@@ -417,7 +555,33 @@ static int mods(NSEvent *e) {
   double dy = e.hasPreciseScrollingDeltas ? e.scrollingDeltaY : e.scrollingDeltaY * 16.0;
   emitJSON(@{ @"event": @"scroll", @"x": @(p.x), @"y": @(p.y), @"dx": @(dx), @"dy": @(dy) });
 }
-- (void)keyDown:(NSEvent *)e { [self emitKey:e kind:@"keydown"]; }
+- (void)keyDown:(NSEvent *)e {
+  [self emitKey:e kind:@"keydown"];
+  [self interpretKeyEvents:@[e]];
+}
+// Minimal NSTextInputClient surface: committed text arrives as "insert",
+// preedit (marked) text as "marked", editing selectors as "cmd".
+- (void)insertText:(id)s {
+  NSString *str = [s isKindOfClass:[NSAttributedString class]] ? [s string] : s;
+  emitJSON(@{ @"event": @"insert", @"s": str });
+}
+- (void)setMarkedText:(id)s selectedRange:(NSRange)r replacementRange:(NSRange)rr {
+  NSString *str = [s isKindOfClass:[NSAttributedString class]] ? [s string] : s;
+  emitJSON(@{ @"event": @"marked", @"s": str });
+}
+- (void)unmarkText { emitJSON(@{ @"event": @"marked", @"s": @"" }); }
+- (BOOL)hasMarkedText { return NO; }
+- (NSRange)markedRange { return NSMakeRange(NSNotFound, 0); }
+- (NSRange)selectedRange { return NSMakeRange(0, 0); }
+- (NSArray *)validAttributesForMarkedText { return @[]; }
+- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)r actualRange:(NSRangePointer)a { return nil; }
+- (NSUInteger)characterIndexForPoint:(NSPoint)p { return 0; }
+- (NSRect)firstRectForCharacterRange:(NSRange)r actualRange:(NSRangePointer)a { return NSZeroRect; }
+- (void)doCommandBySelector:(SEL)sel {
+  NSString *name = NSStringFromSelector(sel);
+  if ([name hasSuffix:@":"]) name = [name substringToIndex:name.length - 1];
+  emitJSON(@{ @"event": @"cmd", @"s": name });
+}
 - (void)keyUp:(NSEvent *)e { [self emitKey:e kind:@"keyup"]; }
 - (void)flagsChanged:(NSEvent *)e {
   emitJSON(@{ @"event": @"flags", @"mods": @(mods(e)) });
@@ -506,6 +670,16 @@ int main(int argc, const char *argv[]) {
             [[NSWorkspace sharedWorkspace] openURL:u];
           });
         }
+        NSNumber *getClip = msg[@"getClipboard"];
+        if (getClip) {
+          NSString *str = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
+          emitJSON(@{ @"event": @"clipboard", @"s": str ?: @"" });
+        }
+        NSString *setClip = msg[@"setClipboard"];
+        if (setClip) {
+          [[NSPasteboard generalPasteboard] clearContents];
+          [[NSPasteboard generalPasteboard] setString:setClip forType:NSPasteboardTypeString];
+        }
         NSDictionary *m = msg[@"measure"];
         if (m) {
           NSSize sz = [m[@"s"] sizeWithAttributes:@{NSFontAttributeName: fontFor(m)}];
@@ -579,14 +753,22 @@ export function damageRects(old: Cmd[], now: Cmd[]): Box[] {
 }
 
 export function cmdBox(c: Cmd): Box {
+  if (c.kind === "popClip") return { x: 0, y: 0, w: 0, h: 0 }
   return { x: c.x, y: c.y, w: c.w, h: c.h }
 }
 
 // Topmost hit region at a point (later entries draw on top).
+function inBox(x: f64, y: f64, b: Box): bool {
+  return x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h
+}
+
+// Topmost hit region at a point (later entries draw on top). A region with
+// a clip box only hits inside it — scrolled-out content can't be clicked.
 export function hitAt(x: f64, y: f64, hits: Hit[]): int {
   for (let i = hits.length - 1; i >= 0; i -= 1) {
-    const b = hits[i]!.box
-    if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return i
+    const h = hits[i]!
+    if (h.clip !== undefined && !inBox(x, y, h.clip!)) continue
+    if (inBox(x, y, h.box)) return i
   }
   return -1
 }
@@ -602,6 +784,7 @@ type Ev = {
   dx?: f64, dy?: f64,
   id?: int, scale?: f64,
   key?: string, code?: int, mods?: int, repeat?: bool,
+  s?: string,
 }
 
 export const MOD_CMD = 1
@@ -640,6 +823,23 @@ export function openUrl(url: string) throws Error {
   const w = windows[0]
   if (w === undefined) return
   try w.stdin!.write(`{"open":${JSON.stringify(url)}}\n`)
+}
+
+// The window whose handler is running right now (set at dispatch entry).
+let activeWindow: Window | undefined = undefined
+
+// Asks the helper for the pasteboard string; arrives as a "clipboard"
+// event routed to the focused region's text handler.
+export function readClipboard(w?: Window) throws Error {
+  const win = w ?? activeWindow ?? windows[0]
+  if (win === undefined) return
+  try win.stdin!.write(`{"getClipboard":1}\n`)
+}
+
+export function writeClipboard(s: string, w?: Window) throws Error {
+  const win = w ?? activeWindow ?? windows[0]
+  if (win === undefined) return
+  try win.stdin!.write(`{"setClipboard":${JSON.stringify(s)}}\n`)
 }
 
 export type WindowOptions = { title?: string, width?: int, height?: int, view: () => View }
@@ -714,11 +914,7 @@ export class Window {
   }
 
   hitAt(x: f64, y: f64): int {
-    for (let i = this.hits.length - 1; i >= 0; i -= 1) {
-      const b = this.hits[i]!.box
-      if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return i
-    }
-    return -1
+    return hitAt(x, y, this.hits)
   }
 
   nextFocusable(from: int, dir: int): int {
@@ -733,6 +929,7 @@ export class Window {
   // Apply one helper event to this window's state. Returns true when a
   // re-render is warranted.
   dispatch(ev: Ev): bool {
+    activeWindow = this
     const pt = ev.x !== undefined && ev.y !== undefined
     switch (ev.event) {
       case "mousedown": {
@@ -784,8 +981,9 @@ export class Window {
         for (let i = this.hits.length - 1; i >= 0; i -= 1) {
           const h = this.hits[i]!
           const b = h.box
+          if (h.clip !== undefined && !inBox(ev.x!, ev.y!, h.clip!)) continue
           const scroll = h.on.scroll
-          if (scroll !== undefined && ev.x! >= b.x && ev.x! < b.x + b.w && ev.y! >= b.y && ev.y! < b.y + b.h) {
+          if (scroll !== undefined && inBox(ev.x!, ev.y!, b)) {
             scroll(ev.dx ?? 0, ev.dy ?? 0)
             return true
           }
@@ -822,6 +1020,18 @@ export class Window {
       }
       case "flags":
         return false
+      case "insert":
+      case "cmd":
+      case "marked":
+      case "clipboard": {
+        const focused = this.focus >= 0 && this.focus < this.hits.length ? this.hits[this.focus] : undefined
+        const handler = focused?.on?.text
+        if (handler !== undefined) {
+          handler(ev.event, ev.s ?? "")
+          return true
+        }
+        return false
+      }
       case "focus":
         this.key = true
         return false
@@ -852,24 +1062,63 @@ export class Window {
     }
   }
 
+  // Issues measure requests for every unmeasured text command; returns true
+  // if any were sent.
+  measureCmdTexts(cmds: Cmd[]): bool {
+    let any = false
+    for (const c of cmds) {
+      if (c.kind === "text") {
+        const key = textKey({ s: c.s, size: c.size, bold: c.bold })
+                if (!textCache.has(key) && !inflight.has(key)) {
+          try {
+            any = this.queueMeasure({ s: c.s, size: c.size, bold: c.bold }) || any
+          } catch (e) {
+            console.error(`mytov measure: ${e.message}`)
+          }
+        }
+      }
+    }
+    return any
+  }
+
+  queueMeasure(r: TextRun): bool throws JsError {
+    const key = textKey(r)
+    if (textCache.has(key) || inflight.has(key)) return false
+    const id = measureSeq
+    measureSeq += 1
+    measureKeys.set(id, key)
+    inflight.add(key)
+    this.waits.push(new Promise<Size>((resolve) => measureWaiters.set(id, resolve)))
+    try this.stdin!.write(`{"measure":{"id":${id},"s":${JSON.stringify(r.s)},"size":${r.size},"bold":${r.bold}}}\n`)
+    return true
+  }
+
+  waits: Promise<Size>[] = []
+
+  pendingWaits(): Promise<Size>[] {
+    const w = this.waits
+    this.waits = []
+    return w
+  }
+
   async renderPass() throws Error {
     const v = this.view()
     let runs: TextRun[] = []
     let seen: Set<string> = new Set()
     collectRuns(v, &runs, &seen)
-    const waits: Promise<Size>[] = []
     for (const r of runs) {
-      const id = measureSeq
-      measureSeq += 1
-      const key = textKey(r)
-      measureKeys.set(id, key)
-      inflight.add(key)
-      waits.push(new Promise<Size>((resolve) => measureWaiters.set(id, resolve)))
-      try this.stdin!.write(`{"measure":{"id":${id},"s":${JSON.stringify(r.s)},"size":${r.size},"bold":${r.bold}}}\n`)
+      try this.queueMeasure(r)
     }
-    try await Promise.all(waits)
+    try await Promise.all(this.pendingWaits())
     spinnerSeen = false
-    const l = layout(v, this.w, this.h, { hover: this.hover, pressed: this.pressed, focus: this.key ? this.focus : -1 })
+    let l = layout(v, this.w, this.h, { hover: this.hover, pressed: this.pressed, focus: this.key ? this.focus : -1 })
+    // Views generated during layout (e.g. visible list rows) can carry text
+    // runs collectRuns never saw; measure those and lay out once more.
+    if (this.measureCmdTexts(l.frame.frame)) {
+      try await Promise.all(this.pendingWaits())
+      spinnerSeen = false
+      l = layout(v, this.w, this.h, { hover: this.hover, pressed: this.pressed, focus: this.key ? this.focus : -1 })
+    }
     this.live = spinnerSeen
     this.hits = l.hits
     const json = JSON.stringify(l.frame)

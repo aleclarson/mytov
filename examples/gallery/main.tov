@@ -1,6 +1,6 @@
-import { column, pad, row, run, spacer, text } from "../../src/mytov"
+import { ScrollState, column, list, pad, row, run, spacer, split, SplitState, text } from "../../src/mytov"
 import type { View } from "../../src/mytov"
-import { badge, checkbox, link, meter, progress, radio, segmented, slider, spinner, toggle } from "../../src/widgets"
+import { Field, badge, checkbox, input, link, meter, numberInput, progress, radio, searchField, segmented, slider, spinner, stepper, textarea, toggle } from "../../src/widgets"
 
 class State {
   wifi = true
@@ -9,6 +9,12 @@ class State {
   volume = 0.4
   seg = 0
   loading = true
+  name = new Field()
+  age = new Field()
+  notes = new Field()
+  q = new Field()
+  listScroll = new ScrollState()
+  splitPos = new SplitState()
 }
 
 const s = new State()
@@ -30,8 +36,13 @@ function view(): View {
         segmented(["Day", "Week", "Month"], s.seg, (i) => { s.seg = i }),
         labeled("Progress", progress(s.volume)),
         labeled("Load", meter(s.volume)),
+        labeled("Name", input(s.name, { placeholder: "Your name" })),
+        labeled("Age", row([numberInput(s.age, (d) => { s.age.s = `${(parseInt(s.age.s) ?? 0) + d}` }), stepper((d) => { s.age.s = `${(parseInt(s.age.s) ?? 0) + d}` })], 4)),
+        labeled("Notes", textarea(s.notes, 60)),
+        labeled("Search", searchField(s.q)),
         row([spinner(20), text("loading…", { color: "#6e6e73" })], 8),
         link("github.com/aleclarson/mytov", "https://github.com/aleclarson/mytov"),
+        list(200, 24, (i) => text(`row ${i}`, { color: i % 2 === 0 ? "#111111" : "#555555" }), s.listScroll),
       ],
       12,
     ),

@@ -1,0 +1,40 @@
+import { Field, fieldCommand } from "../src/widgets"
+
+test("insert and backspace edit the buffer", () => {
+  const f = new Field()
+  f.insert("hello")
+  expect(f.s).toBe("hello")
+  expect(f.cursor).toBe(5)
+  f.backspace()
+  expect(f.s).toBe("hell")
+})
+
+test("selection replace and collapse", () => {
+  const f = new Field()
+  f.insert("hello")
+  f.selectAll()
+  f.insert("bye")
+  expect(f.s).toBe("bye")
+  expect(f.anchor).toBe(-1)
+})
+
+test("editing commands move and delete", () => {
+  const f = new Field()
+  f.insert("abc")
+  expect(fieldCommand(f, "moveLeft")).toBe(true)
+  expect(f.cursor).toBe(2)
+  expect(fieldCommand(f, "deleteForward")).toBe(true)
+  expect(f.s).toBe("ab")
+  expect(fieldCommand(f, "moveToBeginningOfLine")).toBe(true)
+  expect(f.cursor).toBe(0)
+})
+
+test("marked text does not disturb the buffer", () => {
+  const f = new Field()
+  f.insert("x")
+  f.marked = "é"
+  expect(f.s).toBe("x")
+  f.insert("é")
+  expect(f.s).toBe("xé")
+  expect(f.marked).toBe("")
+})

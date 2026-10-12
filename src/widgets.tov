@@ -1,4 +1,4 @@
-import { animating, openUrl, textSize, tickCount } from "./mytov"
+import { animating, MOD_CMD, column, openUrl, pad, readClipboard, row, textSize, tickCount, writeClipboard } from "./mytov"
 import type { Box, Cmd, Hit, View, WidgetState } from "./mytov"
 
 // The standard widget set, built on the `custom` view kind: each widget is
@@ -223,4 +223,477 @@ export function link(labelText: string, url: string): View {
       return cmds
     },
   }
+}
+
+// --- text input ---------------------------------------------------------
+
+// Editing model behind `input`. Apps keep a Field per field; the widget
+// renders its text, selection and cursor, and routes insert/command/
+// marked/clipboard ops to it. Character positions count Unicode chars.
+export class Field {
+  s = ""
+  cursor = 0
+  anchor = -1 // selection anchor; -1 = collapsed at cursor
+  marked = "" // IME preedit, drawn after the cursor until it commits
+
+  // Ordered selection range; collapsed is {lo == hi == cursor}.
+  range(): { lo: int, hi: int } {
+    if (this.anchor < 0 || this.anchor === this.cursor) return { lo: this.cursor, hi: this.cursor }
+    return this.anchor < this.cursor ? { lo: this.anchor, hi: this.cursor } : { lo: this.cursor, hi: this.anchor }
+  }
+
+  replace(lo: int, hi: int, t: string) {
+    const cs = this.s.chars()
+    this.s = cs.slice(0, lo).join("") + t + cs.slice(hi).join("")
+    this.cursor = lo + t.chars().length
+    this.anchor = -1
+    this.marked = ""
+  }
+
+  insert(t: string) {
+    const r = this.range()
+    this.replace(r.lo, r.hi, t)
+  }
+
+  backspace() {
+    const r = this.range()
+    if (r.lo < r.hi) this.replace(r.lo, r.hi, "")
+    else if (this.cursor > 0) this.replace(this.cursor - 1, this.cursor, "")
+  }
+
+  fwdDelete() {
+    const r = this.range()
+    if (r.lo < r.hi) this.replace(r.lo, r.hi, "")
+    else if (this.cursor < this.s.chars().length) this.replace(this.cursor, this.cursor + 1, "")
+  }
+
+  moveTo(pos: int, selecting: bool) {
+    const len = this.s.chars().length
+    const p = Math.max(0, Math.min(len, pos))
+    if (selecting) {
+      if (this.anchor < 0) this.anchor = this.cursor
+      this.cursor = p
+    } else {
+      this.cursor = p
+      this.anchor = -1
+    }
+    this.marked = ""
+  }
+
+  move(d: int, selecting: bool) {
+    const r = this.range()
+    if (!selecting && r.lo < r.hi) {
+      // Collapse to the edge in the direction of travel.
+      this.cursor = d < 0 ? r.lo : r.hi
+      this.anchor = -1
+      this.marked = ""
+      return
+    }
+    this.moveTo(this.cursor + d, selecting)
+  }
+
+  selectAll() {
+    this.anchor = 0
+    this.cursor = this.s.chars().length
+  }
+
+  selectedText(): string {
+    const r = this.range()
+    return this.s.chars().slice(r.lo, r.hi).join("")
+  }
+}
+
+const CURSOR = ACCENT
+const SEL_BG = "#0a7aff55"
+const PADX = 7.0
+
+// Editing-selector names from the helper's doCommandBySelector mapped onto
+// Field operations. Returns false for names the field doesn't handle.
+export function fieldCommand(f: Field, name: string): bool {
+  switch (name) {
+    case "moveLeft": f.move(-1, false); return true
+    case "moveRight": f.move(1, false); return true
+    case "moveLeftAndModifySelection": f.move(-1, true); return true
+    case "moveRightAndModifySelection": f.move(1, true); return true
+    case "moveToBeginningOfLine":
+    case "moveToBeginningOfDocument": f.moveTo(0, false); return true
+    case "moveToEndOfLine":
+    case "moveToEndOfDocument": f.moveTo(f.s.chars().length, false); return true
+    case "moveToBeginningOfLineAndModifySelection": f.moveTo(0, true); return true
+    case "moveToEndOfLineAndModifySelection": f.moveTo(f.s.chars().length, true); return true
+    case "deleteBackward": f.backspace(); return true
+    case "deleteForward": f.fwdDelete(); return true
+    case "insertNewline": return false // single-line fields let Enter activate
+    case "selectAll": f.selectAll(); return true
+  }
+  return false
+}
+
+function fieldTextOp(f: Field, op: string, s: string) {
+  switch (op) {
+    case "insert": f.insert(s); break
+    case "marked": f.marked = s; break
+    case "cmd": fieldCommand(f, s); break
+    case "clipboard": f.insert(s); break
+  }
+}
+
+export type InputOpts = { placeholder?: string, numeric?: bool }
+
+// Single-line text input: focus ring, blinking cursor, selection, clipboard
+// via Cmd-C/X/V, arrow/delete/home/end through the helper's edit commands.
+export function input(field: Field, opts?: InputOpts): View {
+  const numeric = opts?.numeric ?? false
+  return {
+    kind: "custom", w: 200.0, h: 24.0,
+    regions: (box) => [{
+      box,
+      on: {
+        focusable: true,
+        key: (e) => {
+          if ((e.mods & MOD_CMD) === 0) return
+          try {
+            if (e.key === "a") field.selectAll()
+            else if (e.key === "c") writeClipboard(field.selectedText())
+            else if (e.key === "x") { writeClipboard(field.selectedText()); const r = field.range(); field.replace(r.lo, r.hi, "") }
+            else if (e.key === "v") readClipboard()
+          } catch (err) {
+            console.error(`mytov clipboard: ${err.message}`)
+          }
+        },
+        text: (op, t) => {
+          if (op === "insert" && numeric && !isNumeric(t)) return
+          fieldTextOp(field, op, t)
+        },
+        press: (x) => field.moveTo(cursorAt(field.s, x - box.x - PADX), false),
+      },
+    }],
+    paint: (box, st) => fieldPaint(box, st, field, opts?.placeholder ?? "", false),
+  }
+}
+
+// The laid-out content origin is only known inside paint/regions; input
+// stores it so press() can turn a click x into a cursor index.
+// (press runs before paint within the same box on the same pass — but the
+// press handler captured at layout time closes over `box` directly, see
+// regions below.)
+function cursorAt(s: string, relX: f64): int {
+  const cs = s.chars()
+  for (let i = 0; i < cs.length; i += 1) {
+    if (textSize(cs.slice(0, i + 1).join(""), 13.0, false).w / 2 + textSize(cs.slice(0, i).join(""), 13.0, false).w / 2 > relX) return i
+  }
+  return cs.length
+}
+
+function isNumeric(s: string): bool {
+  for (const c of s.chars()) {
+    if ("0123456789.-".includes(c) === false) return false
+  }
+  return true
+}
+
+// The editable content of a field: selection, text, marked preedit, cursor.
+function fieldContent(box: Box, st: WidgetState, field: Field, placeholder: string): Cmd[] {
+  const size = 13.0
+  let cmds: Cmd[] = []
+  const content = field.s + field.marked
+  const ty = box.y + (box.h - textSize("x", size, false).h) / 2
+  if (content === "" && !st.focused && placeholder !== "") {
+    cmds.push(textCmd(placeholder, box.x + PADX, ty, box.w - PADX * 2, size, false, DIM))
+  } else {
+    const r = field.range()
+    const cs = field.s.chars()
+    const preW = textSize(cs.slice(0, r.lo).join(""), size, false).w
+    const selW = textSize(cs.slice(r.lo, r.hi).join(""), size, false).w
+    if (r.hi > r.lo) {
+      cmds.push(rect(box.x + PADX + preW, ty, selW, textSize("x", size, false).h, SEL_BG, 0.0))
+    }
+    cmds.push(textCmd(field.s, box.x + PADX, ty, box.w - PADX * 2, size, false, LABEL))
+    if (field.marked !== "") {
+      const mw = textSize(field.s, size, false).w
+      cmds.push(textCmd(field.marked, box.x + PADX + mw, ty, box.w, size, false, LABEL))
+      const uw = textSize(field.marked, size, false).w
+      cmds.push(rect(box.x + PADX + mw, ty + textSize("x", size, false).h - 1.0, uw, 1.0, DIM))
+    }
+    if (st.focused) {
+      animating()
+      const blink = tickCount() % 12 < 7
+      if (blink) {
+        const curW = textSize(cs.slice(0, field.cursor).join(""), size, false).w
+        cmds.push(rect(box.x + PADX + curW, ty, 1.0, textSize("x", size, false).h, CURSOR))
+      }
+    }
+  }
+  return cmds
+}
+
+// Default field chrome (white rounded box + border) plus the content.
+function fieldPaint(box: Box, st: WidgetState, field: Field, placeholder: string, multi: bool): Cmd[] {
+  let cmds: Cmd[] = [
+    rect(box.x, box.y, box.w, box.h, "#ffffff", 5.0),
+    { kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: "", radius: 5.0, stroke: st.focused ? RING : EDGE, lw: st.focused ? 2.0 : 1.0 },
+  ]
+  for (const c of fieldContent(box, st, field, placeholder)) cmds.push(c)
+  return cmds
+}
+
+// Numeric single-line input (filters inserts; arrows step via cmd keys).
+export function numberInput(field: Field, onStep?: (d: int) => void): View {
+  const inner = input(field, { numeric: true })
+  // Wrap: up/down commands step when the app provides onStep.
+  if (onStep === undefined) return inner
+  return {
+    kind: "custom", w: 200.0, h: 24.0,
+    regions: (box) => [{
+      box,
+      on: {
+        focusable: true,
+        text: (op, s) => {
+          if (op === "cmd" && (s === "moveUp" || s === "moveDown")) onStep(s === "moveUp" ? 1 : -1)
+          else fieldTextOp(field, op, s)
+        },
+        press: (x) => field.moveTo(cursorAt(field.s, x - box.x - PADX), false),
+      },
+    }],
+    paint: (box, st) => fieldPaint(box, st, field, "", false),
+  }
+}
+
+// Rounded field with a search glyph.
+export function searchField(field: Field): View {
+  return {
+    kind: "custom", w: 200.0, h: 24.0,
+    regions: (box) => [{
+      box,
+      on: {
+        focusable: true,
+        text: (op, s) => fieldTextOp(field, op, s),
+        press: (x) => field.moveTo(cursorAt(field.s, x - box.x - PADX - 14.0), false),
+      },
+    }],
+    paint: (box, st) => {
+      let cmds: Cmd[] = [
+        rect(box.x, box.y, box.w, box.h, "#f5f5f7", 12.0),
+        { kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: "", radius: 12.0, stroke: st.focused ? RING : EDGE, lw: st.focused ? 2.0 : 1.0 },
+        textCmd("⌕", box.x + PADX, box.y + 4.0, 14.0, 13.0, false, DIM),
+      ]
+      const inner = { x: box.x + 14.0, y: box.y, w: box.w - 14.0, h: box.h }
+      for (const c of fieldContent(inner, { hover: false, pressed: false, focused: st.focused }, field, "Search")) cmds.push(c)
+      return cmds
+    },
+  }
+}
+
+// Up/down stepper; the two halves are separate hit regions.
+export function stepper(onStep: (d: int) => void): View {
+  return {
+    kind: "custom", w: 20.0, h: 22.0,
+    regions: (box) => [
+      { box: { x: box.x, y: box.y, w: box.w, h: box.h / 2 }, on: { press: () => onStep(1) } },
+      { box: { x: box.x, y: box.y + box.h / 2, w: box.w, h: box.h / 2 }, on: { press: () => onStep(-1) } },
+    ],
+    paint: (box) => {
+      let cmds: Cmd[] = [
+        rect(box.x, box.y, box.w, box.h, "#ffffff", 4.0),
+        { kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: "", radius: 4.0, stroke: EDGE, lw: 1.0 },
+        rect(box.x + 1.0, box.y + box.h / 2, box.w - 2.0, 1.0, EDGE),
+        textCmd("+", box.x, box.y, box.w, 12.0, false, LABEL),
+        textCmd("−", box.x, box.y + box.h / 2, box.w, 12.0, false, LABEL),
+      ]
+      return cmds
+    },
+  }
+}
+
+// Multi-line field: soft-wraps by explicit newlines, Enter inserts one,
+// up/down move between lines, cursor walks characters. No horizontal
+// scroll; long lines wrap visually per line.
+export function textarea(field: Field, height?: f64): View {
+  const h = height ?? 80.0
+  return {
+    kind: "custom", w: 240.0, h,
+    regions: (box) => [{
+      box,
+      on: {
+        focusable: true,
+        text: (op, s) => {
+          if (op === "cmd" && s === "insertNewline") { field.insert("\n"); return }
+          fieldTextOp(field, op, s)
+        },
+        press: (x, y) => {
+          // Walk lines for the clicked row, then prefix-measure the column.
+          const lineH = textSize("x", 13.0, false).h
+          const row = Math.trunc((y - box.y - 4.0) / lineH)
+          const lines = field.s.split("\n")
+          let base = 0
+          let line = 0
+          for (const l of lines) {
+            if (line === row) { field.moveTo(base + cursorAt(l, x - box.x - PADX), false); return }
+            base += l.chars().length + 1
+            line += 1
+          }
+          field.moveTo(field.s.chars().length, false)
+        },
+        key: (e) => {
+          if ((e.mods & MOD_CMD) === 0) return
+          try {
+            if (e.key === "a") field.selectAll()
+            else if (e.key === "c") writeClipboard(field.selectedText())
+            else if (e.key === "x") { writeClipboard(field.selectedText()); const r = field.range(); field.replace(r.lo, r.hi, "") }
+            else if (e.key === "v") readClipboard()
+          } catch (err) {
+            console.error(`mytov clipboard: ${err.message}`)
+          }
+        },
+      },
+    }],
+    paint: (box, st) => {
+      const size = 13.0
+      const lineH = textSize("x", size, false).h
+      let cmds: Cmd[] = [
+        rect(box.x, box.y, box.w, box.h, "#ffffff", 5.0),
+        { kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: "", radius: 5.0, stroke: st.focused ? RING : EDGE, lw: st.focused ? 2.0 : 1.0 },
+      ]
+      const lines = field.s.split("\n")
+      let y = box.y + 4.0
+      let base = 0
+      const r = field.range()
+      for (const line of lines) {
+        const lcs = line.chars()
+        const inLine = field.cursor >= base && field.cursor <= base + lcs.length
+        const selLo = Math.max(r.lo, base) - base
+        const selHi = Math.min(r.hi, base + lcs.length) - base
+        if (selHi > selLo) {
+          const sx = textSize(lcs.slice(0, selLo).join(""), size, false).w
+          const sw = textSize(lcs.slice(selLo, selHi).join(""), size, false).w
+          cmds.push(rect(box.x + PADX + sx, y, sw, lineH, SEL_BG))
+        }
+        cmds.push(textCmd(line === "" ? " " : line, box.x + PADX, y, box.w - PADX * 2, size, false, LABEL))
+        if (st.focused && inLine) {
+          animating()
+          if (tickCount() % 12 < 7) {
+            const cx = textSize(lcs.slice(0, field.cursor - base).join(""), size, false).w
+            cmds.push(rect(box.x + PADX + cx, y, 1.0, lineH, CURSOR))
+          }
+        }
+        y += lineH
+        base += lcs.length + 1
+      }
+      if (field.marked !== "") cmds.push(textCmd(field.marked, box.x + PADX, y, box.w - PADX * 2, size, false, DIM))
+      return cmds
+    },
+  }
+}
+
+// --- containers ---------------------------------------------------------
+
+export function tabs(items: string[], selected: int, onSelect: (i: int) => void, content: View): View {
+  let headers: View[] = []
+  for (let i = 0; i < items.length; i += 1) {
+    const idx = i
+    headers.push({
+      kind: "custom", w: textSize(items[i]!, 13.0, i === selected).w + 24.0, h: 30.0,
+      regions: (box) => [{ box, on: { click: () => onSelect(idx), focusable: true } }],
+      paint: (box, st) => {
+        let cmds: Cmd[] = []
+        const on = i === selected
+        if (on) cmds.push(rect(box.x, box.y + box.h - 2.0, box.w, 2.0, ACCENT))
+        cmds.push(vcenter(items[i]!, box.x, box.y, box.w, box.h, 13.0, on, on ? LABEL : st.hover ? LABEL : DIM))
+        if (st.focused) cmds.push(focusRing(box))
+        return cmds
+      },
+    })
+  }
+  return column([row(headers, 4), content], 0)
+}
+
+// Vertical sidebar pane; the app supplies the content pane separately.
+export function sidebar(items: string[], selected: int, onSelect: (i: int) => void, width?: f64): View {
+  const w = width ?? 180.0
+  let rows: View[] = []
+  for (let i = 0; i < items.length; i += 1) {
+    const idx = i
+    rows.push({
+      kind: "custom", w, h: 28.0,
+      regions: (box) => [{ box, on: { click: () => onSelect(idx), focusable: true } }],
+      paint: (box, st) => {
+        let cmds: Cmd[] = []
+        const on = i === selected
+        if (on) cmds.push(rect(box.x, box.y, box.w, box.h, "#0a7aff22", 5.0))
+        if (st.hover && !on) cmds.push(rect(box.x, box.y, box.w, box.h, "#00000008", 5.0))
+        cmds.push(vcenter(items[i]!, box.x + 10.0, box.y, box.w - 10.0, box.h, 13.0, on, on ? LABEL : LABEL))
+        if (st.focused) cmds.push(focusRing(box))
+        return cmds
+      },
+    })
+  }
+  return column(rows, 2)
+}
+
+// Expandable sections; app holds the open set per section.
+export function accordion(sections: { title: string, open: bool, child: View }[], onToggle: (i: int) => void): View {
+  let rows: View[] = []
+  for (let i = 0; i < sections.length; i += 1) {
+    const sec = sections[i]!
+    const idx = i
+    rows.push({
+      kind: "custom", w: 240.0, h: 28.0,
+      regions: (box) => [{ box, on: { click: () => onToggle(idx), focusable: true } }],
+      paint: (box, st) => {
+        let cmds: Cmd[] = [
+          textCmd(sec.open ? "▾" : "▸", box.x + 4.0, box.y + 5.0, 16.0, 13.0, false, DIM),
+          vcenter(sec.title, box.x + 22.0, box.y, box.w - 22.0, box.h, 13.0, true, st.hover ? LABEL : LABEL),
+        ]
+        if (st.hover) cmds.push(rect(box.x, box.y + box.h - 1.0, box.w, 1.0, EDGE))
+        if (st.focused) cmds.push(focusRing(box))
+        return cmds
+      },
+    })
+    if (sec.open) rows.push(pad(8, sec.child))
+  }
+  return column(rows, 0)
+}
+
+// Breadcrumb trail; each non-last crumb is clickable.
+export function breadcrumbs(items: string[], onNavigate: (i: int) => void): View {
+  let parts: View[] = []
+  for (let i = 0; i < items.length; i += 1) {
+    const last = i === items.length - 1
+    const idx = i
+    const s = textSize(items[i]!, 13.0, last)
+    parts.push({
+      kind: "custom", w: s.w, h: s.h,
+      on: last ? undefined : { click: () => onNavigate(idx) },
+      paint: (box, st) => [textCmd(items[i]!, box.x, box.y, box.w, 13.0, last, last ? LABEL : st.hover ? ACCENT : DIM)],
+    })
+    if (!last) {
+      parts.push({ kind: "custom", w: 12.0, h: s.h, paint: (box) => [textCmd("›", box.x + 4.0, box.y, box.w, 13.0, false, DIM)] })
+    }
+  }
+  return row(parts, 2)
+}
+
+export type TreeNode = { label: string, expanded: bool, children: TreeNode[], onToggle: () => void }
+
+// Indented outline with disclosure triangles; expansion lives in the app.
+export function tree(nodes: TreeNode[], depth?: int): View {
+  const d = depth ?? 0
+  let rows: View[] = []
+  for (const n of nodes) {
+    const node = n
+    const s = textSize(n.label, 13.0, false)
+    rows.push({
+      kind: "custom", w: d * 16.0 + 18.0 + s.w, h: 24.0,
+      regions: (box) => [{ box, on: { click: () => node.onToggle(), focusable: true } }],
+      paint: (box, st) => {
+        let cmds: Cmd[] = []
+        if (st.hover) cmds.push(rect(box.x, box.y, box.w + 200.0, box.h, "#00000008", 3.0))
+        cmds.push(textCmd(node.children.length > 0 ? (node.expanded ? "▾" : "▸") : " ", box.x + d * 16.0 + 2.0, box.y + 3.0, 14.0, 12.0, false, DIM))
+        cmds.push(textCmd(node.label, box.x + d * 16.0 + 18.0, box.y + 3.0, s.w + 4.0, 13.0, false, LABEL))
+        return cmds
+      },
+    })
+    if (n.expanded) rows.push(tree(n.children, d + 1))
+  }
+  return column(rows, 0)
 }
