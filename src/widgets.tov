@@ -1,4 +1,4 @@
-import { animating, MOD_CMD, column, openUrl, pad, readClipboard, row, textSize, tickCount, writeClipboard } from "./mytov"
+import { animating, MOD_CMD, bg, column, openUrl, overlay, pad, readClipboard, row, textSize, tickCount, writeClipboard } from "./mytov"
 import type { Box, Cmd, Hit, View, WidgetState } from "./mytov"
 
 // The standard widget set, built on the `custom` view kind: each widget is
@@ -696,4 +696,59 @@ export function tree(nodes: TreeNode[], depth?: int): View {
     if (n.expanded) rows.push(tree(n.children, d + 1))
   }
   return column(rows, 0)
+}
+
+// --- overlays -----------------------------------------------------------
+
+// Rounded card chrome for dialogs/popovers.
+export function card(content: View): View {
+  return pad(16, bg("#ffffff", content, 10.0, EDGE))
+}
+
+// Centered dimmed dialog above `base`; nothing below takes input while open.
+export function modal(base: View, content: View, open: bool): View {
+  return overlay(base, open ? card(content) : undefined, { dim: true, capture: true })
+}
+
+// Floating message pill at the bottom edge while `show`.
+export function toast(base: View, message: string, show: bool): View {
+  if (!show) return base
+  return overlay(base, {
+    kind: "custom", w: textSize(message, 13.0, false).w + 32.0, h: 32.0,
+    paint: (box) => [
+      rect(box.x, box.y, box.w, box.h, "#323232", 16.0),
+      vcenter(message, box.x, box.y, box.w, box.h, 13.0, false, "#ffffff"),
+    ],
+  }, { anchor: "bottom" })
+}
+
+// Floating panel at a point (e.g. a saved right-click location).
+export function popover(base: View, content: View, at?: Box): View {
+  return overlay(base, at === undefined ? undefined : card(content), { capture: true, at })
+}
+
+// Item list menu at a point — context menus and select popups.
+export function menuAt(base: View, items: string[], at: Box | undefined, onSelect: (i: int) => void): View {
+  if (at === undefined) return base
+  let rows: View[] = []
+  for (let i = 0; i < items.length; i += 1) {
+    const idx = i
+    const label = items[i]!
+    rows.push({
+      kind: "custom", w: Math.max(160.0, textSize(label, 13.0, false).w + 24.0), h: 26.0,
+      regions: (box) => [{ box, on: { click: () => onSelect(idx) } }],
+      paint: (box, st) => {
+        let cmds: Cmd[] = []
+        if (st.hover) cmds.push(rect(box.x, box.y, box.w, box.h, ACCENT))
+        cmds.push(textCmd(label, box.x + 12.0, box.y + 4.0, box.w - 24.0, 13.0, false, st.hover ? "#ffffff" : LABEL))
+        return cmds
+      },
+    })
+  }
+  return overlay(base, card(column(rows, 0)), { capture: true, at })
+}
+
+// Slide-out panel on the right edge while `open`.
+export function drawer(base: View, content: View, open: bool, width?: f64): View {
+  return overlay(base, open ? bg("#ffffff", content) : undefined, { anchor: "right", capture: true })
 }

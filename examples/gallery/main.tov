@@ -1,6 +1,6 @@
-import { ScrollState, column, list, pad, row, run, spacer, split, SplitState, text } from "../../src/mytov"
+import { ScrollState, button, column, list, pad, row, run, spacer, split, SplitState, text } from "../../src/mytov"
 import type { View } from "../../src/mytov"
-import { Field, badge, checkbox, input, link, meter, numberInput, progress, radio, searchField, segmented, slider, spinner, stepper, textarea, toggle } from "../../src/widgets"
+import { Field, badge, checkbox, drawer, input, link, menuAt, meter, modal, numberInput, progress, radio, searchField, segmented, slider, spinner, stepper, textarea, toast, toggle } from "../../src/widgets"
 
 class State {
   wifi = true
@@ -15,6 +15,10 @@ class State {
   q = new Field()
   listScroll = new ScrollState()
   splitPos = new SplitState()
+  showDialog = false
+  showToast = false
+  ctxAt: { x: f64, y: f64, w: f64, h: f64 } | undefined = undefined
+  drawerOpen = false
 }
 
 const s = new State()
@@ -24,7 +28,7 @@ function labeled(labelText: string, child: View): View {
 }
 
 function view(): View {
-  return pad(
+  const base = pad(
     24,
     column(
       [
@@ -43,10 +47,22 @@ function view(): View {
         row([spinner(20), text("loading…", { color: "#6e6e73" })], 8),
         link("github.com/aleclarson/mytov", "https://github.com/aleclarson/mytov"),
         list(200, 24, (i) => text(`row ${i}`, { color: i % 2 === 0 ? "#111111" : "#555555" }), s.listScroll),
+        row([
+          button("Dialog", () => { s.showDialog = true }),
+          button("Toast", () => { s.showToast = true }),
+          button("Drawer", () => { s.drawerOpen = !s.drawerOpen }),
+        ], 8),
       ],
       12,
     ),
   )
+  const menu = menuAt(base, ["Copy", "Paste", "Inspect"], s.ctxAt, () => { s.ctxAt = undefined })
+  const dlg = modal(menu, column([
+    text("A dialog", { size: 16, bold: true }),
+    button("Close", () => { s.showDialog = false }),
+  ], 10), s.showDialog)
+  const drw = drawer(dlg, column([text("Inspector", { bold: true }), text("side panel")], 8), s.drawerOpen, 220)
+  return toast(drw, "Saved", s.showToast)
 }
 
 try run({ title: "Widgets", width: 440, height: 420, view })

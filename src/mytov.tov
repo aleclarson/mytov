@@ -41,7 +41,8 @@ export type View =
   | { kind: "pad", inset: f64, child: View }
   | { kind: "scroll", st: ScrollState, child: View }
   | { kind: "split", st: SplitState, left: View, right: View }
-  | { kind: "bg", color: string, child: View }
+  | { kind: "bg", color: string, radius: f64, stroke: string, child: View }
+  | { kind: "overlay", child: View, layer: View | undefined, anchor: string, dim: bool, capture: bool, at?: Box }
   | { kind: "list", st: ScrollState, count: int, rowH: f64, row: (i: int) => View }
   | { kind: "spacer" }
 
@@ -98,8 +99,17 @@ export function split(left: View, right: View, st: SplitState): View {
 }
 
 // Fills its box with a solid color behind the child.
-export function bg(color: string, child: View): View {
-  return { kind: "bg", color, child }
+export function bg(color: string, child: View, radius?: f64, stroke?: string): View {
+  return { kind: "bg", color, radius: radius ?? 0.0, stroke: stroke ?? "", child }
+}
+
+// Layered view: `layer` draws and hit-tests above `child`. anchor is
+// "center" | "top" | "bottom" | "left" | "right" (layer keeps intrinsic
+// size except left/right, which stretch vertically; top/bottom stretch
+// horizontally? no — top/bottom center horizontally, anchored to edge).
+// dim adds a scrim behind the layer; capture blocks input below it.
+export function overlay(child: View, layer: View | undefined, opts?: { anchor?: string, dim?: bool, capture?: bool, at?: Box }): View {
+  return { kind: "overlay", child, layer, anchor: opts?.anchor ?? (opts?.at !== undefined ? "at" : "center"), dim: opts?.dim ?? false, capture: opts?.capture ?? false, at: opts?.at }
 }
 
 // Virtualized rows: only the visible slice is laid out per frame.
@@ -180,6 +190,10 @@ function collectRuns(v: View, inout out: TextRun[], inout seen: Set<string>) {
       collectRuns(v.left, &out, &seen)
       collectRuns(v.right, &out, &seen)
       break
+    case "overlay":
+      collectRuns(v.child, &out, &seen)
+      if (v.layer !== undefined) collectRuns(v.layer, &out, &seen)
+      break
     case "custom":
     case "list":
       break
@@ -213,6 +227,7 @@ export function measure(v: View): Size {
     case "split":
       return { w: 0, h: 0 }
     case "bg":
+    case "overlay":
       return measure(v.child)
     case "column": {
       let w = 0
@@ -352,9 +367,35 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[], s
       break
     }
     case "bg":
-      cmds.push({ kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: v.color, radius: 0.0, stroke: "", lw: 0.0 })
+      cmds.push({ kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: v.color, radius: v.radius, stroke: v.stroke, lw: v.stroke === "" ? 0.0 : 1.0 })
       place(v.child, box, &cmds, &hits, st, clip)
       break
+    case "overlay": {
+      place(v.child, box, &cmds, &hits, st, clip)
+      if (v.layer === undefined) break
+      const layer = v.layer
+      if (v.dim) cmds.push({ kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: "#00000055", radius: 0.0, stroke: "", lw: 0.0 })
+      // A capture region under the layer's regions eats clicks that would
+      // otherwise fall through to the child.
+      if (v.capture || v.dim) hits.push(tagClip({ box, on: {} }, clip))
+      const s = measure(layer)
+      const m = 12.0
+      let lb: Box
+      switch (v.anchor) {
+        case "at": {
+          const at = v.at ?? { x: box.x + m, y: box.y + m, w: 0, h: 0 }
+          lb = { x: Math.min(at.x, box.x + box.w - s.w - m), y: Math.min(at.y, box.y + box.h - s.h - m), w: s.w, h: s.h }
+          break
+        }
+        case "top": lb = { x: box.x + (box.w - s.w) / 2, y: box.y + m, w: s.w, h: s.h }; break
+        case "bottom": lb = { x: box.x + (box.w - s.w) / 2, y: box.y + box.h - s.h - m, w: s.w, h: s.h }; break
+        case "left": lb = { x: box.x + m, y: box.y + m, w: s.w, h: box.h - m * 2 }; break
+        case "right": lb = { x: box.x + box.w - s.w - m, y: box.y + m, w: s.w, h: box.h - m * 2 }; break
+        default: lb = { x: box.x + (box.w - s.w) / 2, y: box.y + (box.h - s.h) / 2, w: s.w, h: s.h }; break
+      }
+      place(layer, lb, &cmds, &hits, st, clip)
+      break
+    }
     case "pad":
       place(v.child, { x: box.x + v.inset, y: box.y + v.inset, w: box.w - v.inset * 2, h: box.h - v.inset * 2 }, &cmds, &hits, st, clip)
       break
