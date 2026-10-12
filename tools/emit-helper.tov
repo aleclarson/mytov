@@ -1,0 +1,8 @@
+import { writeFileSync } from "node:fs"
+import { helperSource } from "../src/mytov"
+
+// Writes the embedded helper's Objective-C source to the path in argv[2]
+// (argv[0] and argv[1] are both the running binary under tov run).
+const out = process.argv[2] ?? process.argv[1]!
+try writeFileSync(out, helperSource())
+console.log(out)

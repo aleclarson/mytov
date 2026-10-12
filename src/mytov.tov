@@ -952,7 +952,17 @@ int main(int argc, const char *argv[]) {
 }
 `
 
+export function helperSource(): string {
+  return HELPER_SRC
+}
+
+// Packaged apps ship the precompiled helper next to the executable (or an
+// explicit MYTOV_HELPER); dev builds compile the embedded source to ~/.cache.
 function helperPath(): string {
+  const env = process.env.MYTOV_HELPER
+  if (env !== undefined && existsSync(env)) return env
+  const beside = path.join(path.dirname(process.argv[0]!), "mytov-helper")
+  if (existsSync(beside)) return beside
   const home = (process.env.HOME ?? process.env.USERPROFILE)!
   const dir = path.join(home, ".cache", "mytov")
   const src = path.join(dir, "mytov-window.m")
