@@ -848,6 +848,20 @@ int main(int argc, const char *argv[]) {
             [m popUpMenuPositioningItem:nil atLocation:p inView:gView];
           });
         }
+        NSDictionary *tray = msg[@"tray"];
+        if (tray) {
+          dispatch_async(dispatch_get_main_queue(), ^{
+            static NSStatusItem *item;
+            if (!item) item = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
+            item.button.title = tray[@"title"] ?: @"";
+            NSArray *items = tray[@"items"];
+            if (items) {
+              NSMenu *m = [NSMenu new];
+              for (NSDictionary *it in items) [m addItem:menuItemFor(it)];
+              item.menu = m;
+            }
+          });
+        }
         NSDictionary *m = msg[@"measure"];
         if (m) {
           NSSize sz = [m[@"s"] sizeWithAttributes:@{NSFontAttributeName: fontFor(m)}];
@@ -1399,6 +1413,14 @@ export function setMenus(menus: MenuSpec[]) throws Error {
   for (const m of menus) out.push({ title: m.title, items: menuPayload(m.items) })
   const msg = `{"menus":${JSON.stringify(out)}}\n`
   for (const w of windows) try w.stdin!.write(msg)
+}
+
+// Creates or updates the status-bar item; items become its click menu.
+export function setTray(opts: { title: string, items?: MenuItem[] }) throws Error {
+  const w = windows[0]
+  if (w === undefined) return
+  const items = opts.items === undefined ? "null" : JSON.stringify(menuPayload(opts.items))
+  try w.stdin!.write(`{"tray":{"title":${JSON.stringify(opts.title)},"items":${items}}}\n`)
 }
 
 // Pops a context menu at a view-space point in a window (the app's
