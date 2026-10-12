@@ -1,4 +1,4 @@
-import { button, column, layout, measure, text } from "../src/mytov"
+import { button, column, hitAt, layout, measure, text } from "../src/mytov"
 
 test("column measures its children plus gaps", () => {
   const v = column([text("a"), text("bb")], 10)
@@ -19,10 +19,35 @@ test("column centers the stack vertically and children horizontally", () => {
   }
 })
 
-test("a button registers a hit region over its rect", () => {
+test("a button registers a focusable hit region over its rect", () => {
   const v = column([button("Increment", () => {})], 0)
   const l = layout(v, 200, 100)
   expect(l.hits.length).toBe(1)
   const b = l.hits[0]!.box
   expect(b.h).toBe(30)
+  expect(l.hits[0]!.on.focusable).toBe(true)
+})
+
+test("hitAt finds the topmost region or -1", () => {
+  const v = column([text("hi"), button("B", () => {})], 0)
+  const l = layout(v, 200, 100)
+  const b = l.hits[0]!.box
+  expect(hitAt(b.x + 1, b.y + 1, l.hits)).toBe(0)
+  expect(hitAt(0, 0, l.hits)).toBe(-1)
+})
+
+test("pressed and focused buttons draw differently", () => {
+  const v = column([button("B", () => {})], 0)
+  const plain = layout(v, 200, 100)
+  const styled = layout(v, 200, 100, { hover: -1, pressed: 0, focus: 0 })
+  const a = plain.frame.frame[0]!
+  const b = styled.frame.frame[0]!
+  const ring = styled.frame.frame[1]!
+  if (a.kind === "rect" && b.kind === "rect" && ring.kind === "rect") {
+    expect(a.color).toBe("#0a7aff")
+    expect(b.color).toBe("#045cc4")
+    expect(ring.stroke).toBe("#6bb3ff")
+  } else {
+    expect(true).toBe(false)
+  }
 })

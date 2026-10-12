@@ -10,9 +10,22 @@ import * as path from "node:path"
 
 // --- views ------------------------------------------------------------
 
+export type KeyEv = { code: int, key: string, mods: int, repeat: bool }
+
+// Event handlers a region of the layout can carry. `focusable` puts the
+// region in the Tab chain; a focused region gets key events first.
+export type Handlers = {
+  click?: () => void,
+  hover?: (hovering: bool) => void,
+  scroll?: (dx: f64, dy: f64) => void,
+  key?: (e: KeyEv) => void,
+  focusable?: bool,
+}
+
 export type View =
   | { kind: "text", s: string, size: f64, bold: bool, color: string }
   | { kind: "button", title: string, onClick: () => void }
+  | { kind: "events", child: View, on: Handlers }
   | { kind: "column", gap: f64, children: View[] }
   | { kind: "row", gap: f64, children: View[] }
   | { kind: "pad", inset: f64, child: View }
@@ -44,14 +57,20 @@ export function spacer(): View {
   return { kind: "spacer" }
 }
 
+// Attach event handlers to a view's region. Handlers on an inner view win
+// over an `on` wrapper's where they overlap (inner is more specific).
+export function on(child: View, handlers: Handlers): View {
+  return { kind: "events", child, on: handlers }
+}
+
 // --- layout ------------------------------------------------------------
 
 export type Size = { w: f64, h: f64 }
 export type Box = { x: f64, y: f64, w: f64, h: f64 }
-export type Hit = { box: Box, onClick: () => void }
+export type Hit = { box: Box, on: Handlers }
 
 export type Cmd =
-  | { kind: "rect", x: f64, y: f64, w: f64, h: f64, color: string, radius: f64 }
+  | { kind: "rect", x: f64, y: f64, w: f64, h: f64, color: string, radius: f64, stroke: string, lw: f64 }
   | { kind: "text", x: f64, y: f64, w: f64, h: f64, s: string, size: f64, color: string, bold: bool }
 export type Frame = { frame: Cmd[] }
 
@@ -95,6 +114,9 @@ function collectRuns(v: View, inout out: TextRun[], inout seen: Set<string>) {
     case "pad":
       collectRuns(v.child, &out, &seen)
       break
+    case "events":
+      collectRuns(v.child, &out, &seen)
+      break
     case "column":
     case "row":
       for (const c of v.children) collectRuns(c, &out, &seen)
@@ -116,6 +138,8 @@ export function measure(v: View): Size {
       const s = measure(v.child)
       return { w: s.w + v.inset * 2, h: s.h + v.inset * 2 }
     }
+    case "events":
+      return measure(v.child)
     case "column": {
       let w = 0
       let h = v.gap * (v.children.length - 1)
@@ -139,23 +163,43 @@ export function measure(v: View): Size {
   }
 }
 
+// Indexes into the hit list of the live window's hovered / pressed /
+// focused region; -1 means none. Hit index stands in for view identity:
+// trees are rebuilt every render, so state is stable only while the tree
+// keeps the same shape.
+export type Styles = { hover: int, pressed: int, focus: int }
+
+const NO_HIT: Styles = { hover: -1, pressed: -1, focus: -1 }
+
 // Lays `v` out inside `box`. Rows and columns center their stack on the
 // main axis and each child on the cross axis; spacers split leftover
 // space evenly.
-export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[]) {
+export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[], st?: Styles) {
+  const style = st ?? NO_HIT
   switch (v.kind) {
     case "text":
       cmds.push({ kind: "text", x: box.x, y: box.y, w: box.w, h: box.h, s: v.s, size: v.size, color: v.color, bold: v.bold })
       break
     case "button": {
-      cmds.push({ kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: "#0a7aff", radius: 6.0 })
+      const idx = hits.length
+      const color = style.pressed === idx ? "#045cc4" : style.hover === idx ? "#1a86ff" : "#0a7aff"
+      cmds.push({ kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color, radius: 6.0, stroke: "", lw: 0.0 })
+      if (style.focus === idx) {
+        cmds.push({ kind: "rect", x: box.x - 2.5, y: box.y - 2.5, w: box.w + 5.0, h: box.h + 5.0, color: "", radius: 8.0, stroke: "#6bb3ff", lw: 2.0 })
+      }
       const th = textSize(v.title, 15.0, true).h
       cmds.push({ kind: "text", x: box.x, y: box.y + (box.h - th) / 2, w: box.w, h: th, s: v.title, size: 15.0, color: "#ffffff", bold: true })
-      hits.push({ box, onClick: v.onClick })
+      hits.push({ box, on: { click: v.onClick, focusable: true } })
       break
     }
+    case "events":
+      // Register the wrapper's region before placing the child so the
+      // child's own regions come later in the list and win hit-testing.
+      hits.push({ box, on: v.on })
+      place(v.child, box, &cmds, &hits, st)
+      break
     case "pad":
-      place(v.child, { x: box.x + v.inset, y: box.y + v.inset, w: box.w - v.inset * 2, h: box.h - v.inset * 2 }, &cmds, &hits)
+      place(v.child, { x: box.x + v.inset, y: box.y + v.inset, w: box.w - v.inset * 2, h: box.h - v.inset * 2 }, &cmds, &hits, st)
       break
     case "spacer":
       break
@@ -177,7 +221,7 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[]) {
         const s = sizes[i]!
         const h = c.kind === "spacer" ? perSpacer : s.h
         const w = Math.min(s.w, box.w)
-        place(c, { x: box.x + (box.w - w) / 2, y, w, h }, &cmds, &hits)
+        place(c, { x: box.x + (box.w - w) / 2, y, w, h }, &cmds, &hits, st)
         y += h + v.gap
         i += 1
       }
@@ -201,7 +245,7 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[]) {
         const s = sizes[i]!
         const w = c.kind === "spacer" ? perSpacer : s.w
         const h = Math.min(s.h, box.h)
-        place(c, { x, y: box.y + (box.h - h) / 2, w, h }, &cmds, &hits)
+        place(c, { x, y: box.y + (box.h - h) / 2, w, h }, &cmds, &hits, st)
         x += w + v.gap
         i += 1
       }
@@ -210,10 +254,10 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[]) {
   }
 }
 
-export function layout(v: View, w: f64, h: f64): { frame: Frame, hits: Hit[] } {
+export function layout(v: View, w: f64, h: f64, st?: Styles): { frame: Frame, hits: Hit[] } {
   let cmds: Cmd[] = []
   let hits: Hit[] = []
-  place(v, { x: 0, y: 0, w, h }, &cmds, &hits)
+  place(v, { x: 0, y: 0, w, h }, &cmds, &hits, st)
   return { frame: { frame: cmds }, hits }
 }
 
@@ -264,7 +308,6 @@ static double num(NSDictionary *d, NSString *k) { return [d[k] doubleValue]; }
 static ListView *gView;
 
 @implementation ListView
-- (BOOL)isFlipped { return YES; }
 - (void)drawRect:(NSRect)dirty {
   [[NSColor whiteColor] setFill];
   NSRectFill(dirty);
@@ -272,10 +315,17 @@ static ListView *gView;
     NSString *kind = cmd[@"kind"];
     if ([kind isEqualToString:@"rect"]) {
       NSRect box = NSMakeRect(num(cmd, @"x"), num(cmd, @"y"), num(cmd, @"w"), num(cmd, @"h"));
-      [color(cmd[@"color"]) setFill];
       double rad = num(cmd, @"radius");
-      if (rad > 0) [[NSBezierPath bezierPathWithRoundedRect:box xRadius:rad yRadius:rad] fill];
-      else NSRectFill(box);
+      NSBezierPath *path = rad > 0 ? [NSBezierPath bezierPathWithRoundedRect:box xRadius:rad yRadius:rad]
+                                   : [NSBezierPath bezierPathWithRect:box];
+      NSString *fill = cmd[@"color"];
+      if (fill.length > 0) { [color(fill) setFill]; [path fill]; }
+      NSString *stroke = cmd[@"stroke"];
+      if (stroke.length > 0) {
+        [color(stroke) setStroke];
+        path.lineWidth = num(cmd, @"lw") > 0 ? num(cmd, @"lw") : 1.0;
+        [path stroke];
+      }
     }
     if ([kind isEqualToString:@"text"]) {
       NSRect box = NSMakeRect(num(cmd, @"x"), num(cmd, @"y"), num(cmd, @"w"), num(cmd, @"h"));
@@ -290,11 +340,53 @@ static ListView *gView;
     }
   }
 }
-- (void)mouseDown:(NSEvent *)e {
+static int mods(NSEvent *e) {
+  int m = 0;
+  if (e.modifierFlags & NSEventModifierFlagCommand) m |= 1;
+  if (e.modifierFlags & NSEventModifierFlagShift) m |= 2;
+  if (e.modifierFlags & NSEventModifierFlagOption) m |= 4;
+  if (e.modifierFlags & NSEventModifierFlagControl) m |= 8;
+  return m;
+}
+
+- (BOOL)isFlipped { return YES; }
+- (BOOL)acceptsFirstResponder { return YES; }
+- (instancetype)initWithFrame:(NSRect)f {
+  self = [super initWithFrame:f];
+  if (self) {
+    [self addTrackingArea:[[NSTrackingArea alloc]
+      initWithRect:self.bounds
+      options:NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect
+      owner:self userInfo:nil]];
+  }
+  return self;
+}
+- (void)emitPoint:(NSEvent *)e kind:(NSString *)kind {
   NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
-  char buf[256];
-  snprintf(buf, sizeof(buf), "{\\"event\\":\\"mousedown\\",\\"x\\":%g,\\"y\\":%g}", p.x, p.y);
-  emit(buf);
+  emitJSON(@{ @"event": kind, @"x": @(p.x), @"y": @(p.y) });
+}
+- (void)emitKey:(NSEvent *)e kind:(NSString *)kind {
+  emitJSON(@{ @"event": kind,
+              @"key": e.charactersIgnoringModifiers ?: @"",
+              @"code": @(e.keyCode),
+              @"mods": @(mods(e)),
+              @"repeat": @(e.ARepeat) });
+}
+- (void)mouseDown:(NSEvent *)e { [self emitPoint:e kind:@"mousedown"]; }
+- (void)mouseUp:(NSEvent *)e { [self emitPoint:e kind:@"mouseup"]; }
+- (void)mouseDragged:(NSEvent *)e { [self emitPoint:e kind:@"mousemove"]; }
+- (void)mouseMoved:(NSEvent *)e { [self emitPoint:e kind:@"mousemove"]; }
+- (void)rightMouseDown:(NSEvent *)e { [self emitPoint:e kind:@"rightdown"]; }
+- (void)scrollWheel:(NSEvent *)e {
+  NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+  double dx = e.hasPreciseScrollingDeltas ? e.scrollingDeltaX : e.scrollingDeltaX * 16.0;
+  double dy = e.hasPreciseScrollingDeltas ? e.scrollingDeltaY : e.scrollingDeltaY * 16.0;
+  emitJSON(@{ @"event": @"scroll", @"x": @(p.x), @"y": @(p.y), @"dx": @(dx), @"dy": @(dy) });
+}
+- (void)keyDown:(NSEvent *)e { [self emitKey:e kind:@"keydown"]; }
+- (void)keyUp:(NSEvent *)e { [self emitKey:e kind:@"keyup"]; }
+- (void)flagsChanged:(NSEvent *)e {
+  emitJSON(@{ @"event": @"flags", @"mods": @(mods(e)) });
 }
 - (void)emitGeometry {
   NSSize size = self.bounds.size;
@@ -321,6 +413,8 @@ static ListView *gView;
 @end
 @implementation Delegate
 - (void)windowWillClose:(NSNotification *)note { [NSApp terminate:nil]; }
+- (void)windowDidBecomeKey:(NSNotification *)note { emitJSON(@{ @"event": @"focus" }); }
+- (void)windowDidResignKey:(NSNotification *)note { emitJSON(@{ @"event": @"blur" }); }
 @end
 
 // NSWindow.delegate is weak; keep it alive for the process.
@@ -386,10 +480,13 @@ int main(int argc, const char *argv[]) {
         char buf[256];
         snprintf(buf, sizeof(buf), "{\\"event\\":\\"mousedown\\",\\"x\\":%g,\\"y\\":%g}", cx, cy);
         emit(buf);
+        snprintf(buf, sizeof(buf), "{\\"event\\":\\"mouseup\\",\\"x\\":%g,\\"y\\":%g}", cx, cy);
+        emit(buf);
       });
     }
 
     [win makeKeyAndOrderFront:nil];
+    [win makeFirstResponder:gView];
     [NSApp activateIgnoringOtherApps:YES];
     // The Tov side may attach its line reader after the first setFrameSize;
     // re-announce geometry once the run loop is up.
@@ -418,7 +515,21 @@ function helperPath(): string {
 
 export type AppOptions = { title?: string, width?: int, height?: int, view: () => View }
 
-type Ev = { event: string, x?: f64, y?: f64, w?: f64, h?: f64, id?: int, scale?: f64 }
+// Event packets from the helper. `key` is charactersIgnoringModifiers,
+// `code` the macOS keyCode; mods is a bitmask (cmd 1, shift 2, alt 4, ctrl 8).
+type Ev = {
+  event: string,
+  x?: f64, y?: f64,
+  w?: f64, h?: f64,
+  dx?: f64, dy?: f64,
+  id?: int, scale?: f64,
+  key?: string, code?: int, mods?: int, repeat?: bool,
+}
+
+export const MOD_CMD = 1
+export const MOD_SHIFT = 2
+export const MOD_ALT = 4
+export const MOD_CTRL = 8
 
 let winW = 480.0
 let winH = 360.0
@@ -432,6 +543,140 @@ let stdin: Js | undefined = undefined
 let measureSeq = 0
 const measureKeys: Map<int, string> = new Map()
 const measureWaiters: Map<int, (s: Size) => void> = new Map()
+let hoverIdx = -1
+let pressedIdx = -1
+let focusIdx = -1
+let winFocused = false
+
+// Topmost hit region at a point (later entries draw on top).
+export function hitAt(x: f64, y: f64, hits: Hit[]): int {
+  for (let i = hits.length - 1; i >= 0; i -= 1) {
+    const b = hits[i]!.box
+    if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return i
+  }
+  return -1
+}
+
+function resolveMeasure(ev: Ev) {
+  if (ev.id === undefined || ev.w === undefined || ev.h === undefined) return
+  const key = measureKeys.get(ev.id)
+  if (key === undefined) return
+  const size = { w: ev.w, h: ev.h }
+  textCache.set(key, size)
+  inflight.delete(key)
+  const waiter = measureWaiters.get(ev.id)
+  if (waiter !== undefined) {
+    measureWaiters.delete(ev.id)
+    waiter(size)
+  }
+}
+
+const KEY_ENTER = 36
+const KEY_SPACE = 49
+const KEY_TAB = 48
+
+function nextFocusable(from: int, dir: int): int {
+  const n = lastHits.length
+  for (let step = 1; step <= n; step += 1) {
+    const i = ((from + dir * step) % n + n) % n
+    if (lastHits[i]!.on.focusable === true) return i
+  }
+  return -1
+}
+
+// Apply one helper event to window state. Returns true when a re-render is
+// warranted (state or damage changed); "measured" is handled separately.
+export function dispatchEvent(ev: Ev): bool {
+  const pt = ev.x !== undefined && ev.y !== undefined
+  switch (ev.event) {
+    case "mousedown":
+      pressedIdx = pt ? hitAt(ev.x!, ev.y!, lastHits) : -1
+      if (pressedIdx >= 0 && lastHits[pressedIdx]!.on.focusable === true) focusIdx = pressedIdx
+      return true
+    case "rightdown":
+      // Context menus land with desktop-menus; for now treat as a click.
+      pressedIdx = pt ? hitAt(ev.x!, ev.y!, lastHits) : -1
+      return true
+    case "mouseup": {
+      const was = pressedIdx
+      pressedIdx = -1
+      if (was >= 0 && pt && hitAt(ev.x!, ev.y!, lastHits) === was) {
+        const click = lastHits[was]!.on.click
+        if (click !== undefined) click()
+      }
+      return true
+    }
+    case "mousemove": {
+      const i = pt ? hitAt(ev.x!, ev.y!, lastHits) : -1
+      if (i === hoverIdx) return false
+      if (hoverIdx >= 0) {
+        const h = lastHits[hoverIdx]!.on.hover
+        if (h !== undefined) h(false)
+      }
+      hoverIdx = i
+      if (i >= 0) {
+        const h = lastHits[i]!.on.hover
+        if (h !== undefined) h(true)
+      }
+      return true
+    }
+    case "scroll": {
+      if (!pt) return false
+      for (let i = lastHits.length - 1; i >= 0; i -= 1) {
+        const h = lastHits[i]!
+        const b = h.box
+        const scroll = h.on.scroll
+        if (scroll !== undefined && ev.x! >= b.x && ev.x! < b.x + b.w && ev.y! >= b.y && ev.y! < b.y + b.h) {
+          scroll(ev.dx ?? 0, ev.dy ?? 0)
+          return true
+        }
+      }
+      return false
+    }
+    case "keydown": {
+      const ke: KeyEv = { code: ev.code ?? 0, key: ev.key ?? "", mods: ev.mods ?? 0, repeat: ev.repeat ?? false }
+      if (ke.code === KEY_TAB) {
+        focusIdx = nextFocusable(focusIdx, (ke.mods & MOD_SHIFT) !== 0 ? -1 : 1)
+        return true
+      }
+      const focused = focusIdx >= 0 && focusIdx < lastHits.length ? lastHits[focusIdx] : undefined
+      const keyHandler = focused?.on?.key
+      if (keyHandler !== undefined) {
+        keyHandler(ke)
+        return true
+      }
+      if ((ke.code === KEY_ENTER || ke.code === KEY_SPACE) && focused !== undefined) {
+        const click = focused.on.click
+        if (click !== undefined) click()
+        return true
+      }
+      return false
+    }
+    case "keyup": {
+      const focused = focusIdx >= 0 && focusIdx < lastHits.length ? lastHits[focusIdx] : undefined
+      const keyHandler = focused?.on?.key
+      if (keyHandler !== undefined) {
+        keyHandler({ code: ev.code ?? 0, key: ev.key ?? "", mods: ev.mods ?? 0, repeat: ev.repeat ?? false })
+        return true
+      }
+      return false
+    }
+    case "flags":
+      return false
+    case "focus":
+      winFocused = true
+      return false
+    case "blur":
+      winFocused = false
+      return true
+    case "resize":
+      winW = ev.w ?? winW
+      winH = ev.h ?? winH
+      winScale = ev.scale ?? winScale
+      return true
+  }
+  return false
+}
 
 export function run(opts: AppOptions) throws Error | JsError {
   winW = opts.width ?? 480
@@ -449,34 +694,9 @@ export function run(opts: AppOptions) throws Error | JsError {
     if (debug) console.log(`window> ${line as string}`)
     try {
       const ev = try JSON.parse(line as string) as Ev
-      if (ev.event === "mousedown" && ev.x !== undefined && ev.y !== undefined) {
-        const x = ev.x
-        const y = ev.y
-        for (const hit of lastHits) {
-          const b = hit.box
-          if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) {
-            hit.onClick()
-            break
-          }
-        }
-      } else if (ev.event === "resize" && ev.w !== undefined && ev.h !== undefined) {
-        winW = ev.w
-        winH = ev.h
-        winScale = ev.scale ?? 1.0
-        render(view)
-      } else if (ev.event === "measured" && ev.id !== undefined && ev.w !== undefined && ev.h !== undefined) {
-        const key = measureKeys.get(ev.id)
-        if (key !== undefined) {
-          const size = { w: ev.w!, h: ev.h! }
-          textCache.set(key, size)
-          inflight.delete(key)
-          const waiter = measureWaiters.get(ev.id)
-          if (waiter !== undefined) {
-            measureWaiters.delete(ev.id)
-            waiter(size)
-          }
-        }
-      } else {
+      if (ev.event === "measured") {
+        resolveMeasure(ev)
+      } else if (dispatchEvent(ev)) {
         render(view)
       }
     } catch (e) {
@@ -522,7 +742,7 @@ async function renderPass(view: () => View) throws Error {
     try stdin!.write(`{"measure":{"id":${id},"s":${JSON.stringify(r.s)},"size":${r.size},"bold":${r.bold}}}\n`)
   }
   try await Promise.all(waits)
-  const l = layout(v, winW, winH)
+  const l = layout(v, winW, winH, { hover: hoverIdx, pressed: pressedIdx, focus: winFocused ? focusIdx : -1 })
   lastHits = l.hits
   const json = JSON.stringify(l.frame)
   if (json !== lastFrame) {
