@@ -1,0 +1,28 @@
+import { button, column, layout, measure, text } from "../src/mytov"
+
+test("column measures its children plus gaps", () => {
+  const v = column([text("a"), text("bb")], 10)
+  const s = measure(v)
+  expect(s.h).toBe(15 * 1.35 * 2 + 10)
+})
+
+test("column centers the stack vertically and children horizontally", () => {
+  const v = column([text("hi")], 0)
+  const l = layout(v, 200, 100)
+  const cmd = l.frame.frame[0]!
+  if (cmd.kind === "text") {
+    expect(cmd.w).toBe(2 * 15 * 0.55)
+    expect(cmd.y).toBe((100 - 15 * 1.35) / 2)
+    expect(cmd.x).toBe((200 - 2 * 15 * 0.55) / 2)
+  } else {
+    expect(true).toBe(false)
+  }
+})
+
+test("a button registers a hit region over its rect", () => {
+  const v = column([button("Increment", () => {})], 0)
+  const l = layout(v, 200, 100)
+  expect(l.hits.length).toBe(1)
+  const b = l.hits[0]!.box
+  expect(b.h).toBe(30)
+})

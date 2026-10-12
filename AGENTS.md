@@ -89,3 +89,8 @@ pnpm tsnapi -u
 when you are certain the API change is expected and should become the new committed contract.
 
 If the API drift is accidental, fix the source change instead of updating the snapshot. If intent is unclear, leave the snapshot unchanged and explain the uncertainty.
+
+## References
+
+- mygo (the framework being ported): https://github.com/egoist/mygo
+- Tov language spec (differences from TypeScript): https://raw.githubusercontent.com/richiemcilroy/Tov/refs/heads/main/docs/spec.md

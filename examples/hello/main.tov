@@ -1,0 +1,23 @@
+import { button, column, run, text } from "../../src/mytov"
+import type { View } from "../../src/mytov"
+
+class Counter {
+  n = 0
+}
+
+const counter = new Counter()
+
+function view(): View {
+  return column(
+    [
+      text(`${counter.n}`, { size: 40, bold: true }),
+      button("Increment", () => {
+        counter.n += 1
+        console.log(`count: ${counter.n}`)
+      }),
+    ],
+    12,
+  )
+}
+
+try run({ title: "Counter", width: 480, height: 360, view })

@@ -1,6 +1,7 @@
 {
   "name": "mytov",
   "version": "0.0.0",
+  "private": true,
   "license": "MIT OR Apache-2.0",
   "author": "Alec Larson",
   "repository": {
@@ -8,34 +9,15 @@
     "url": "https://github.com/aleclarson/mytov.git"
   },
   "files": [
-    "dist",
+    "src",
     "docs",
     "examples"
   ],
   "type": "module",
-  "exports": {
-    "types": "./dist/index.d.mts",
-    "default": "./dist/index.mjs"
-  },
   "scripts": {
-    "dev": "tsdown --sourcemap --watch",
-    "build": "tsdown",
-    "format": "oxfmt .",
-    "lint": "oxlint src",
-    "typecheck": "tsc --noEmit && tsc -p test --noEmit",
-    "test": "vitest",
-    "prepublishOnly": "pnpm build",
-    "sync-agent-rules": "curl -fsSL https://gist.githubusercontent.com/aleclarson/4c80686b1c3e204a01cdbe82f8e2c084/raw/AGENTS.md -o AGENTS.md && git add AGENTS.md && git commit -m 'chore: sync agent rules'"
-  },
-  "devDependencies": {
-    "@types/node": "^26.6.4",
-    "oxfmt": "^0.72.0",
-    "oxlint": "^1.87.0",
-    "radashi": "^12.9.6",
-    "tsdown": "^0.23.0",
-    "tsnapi": "^1.5.0",
-    "typescript": "^7.0.2",
-    "vitest": "^5.0.3"
+    "check": "tov check src test examples",
+    "test": "tov test test",
+    "example:hello": "cd examples/hello && tov run main.tov"
   },
   "packageManager": "pnpm@12.8.1"
 }

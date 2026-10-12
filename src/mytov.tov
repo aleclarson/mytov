@@ -1,0 +1,399 @@
+import { createInterface } from "node:readline"
+import { execFileSync, spawn } from "node:child_process"
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import * as path from "node:path"
+
+// mytov draws UI itself, like mygo's package ui — no webview. Tov has no
+// FFI, so a frame becomes a display list: JSON lines on the stdin of a
+// small helper process that owns an NSWindow and paints the list with
+// AppKit/CoreText. Input comes back on its stdout the same way.
+
+// --- views ------------------------------------------------------------
+
+export type View =
+  | { kind: "text", s: string, size: f64, bold: bool, color: string }
+  | { kind: "button", title: string, onClick: () => void }
+  | { kind: "column", gap: f64, children: View[] }
+  | { kind: "row", gap: f64, children: View[] }
+  | { kind: "pad", inset: f64, child: View }
+  | { kind: "spacer" }
+
+export type TextOpts = { size?: f64, bold?: bool, color?: string }
+
+export function text(s: string, opts?: TextOpts): View {
+  return { kind: "text", s, size: opts?.size ?? 15, bold: opts?.bold ?? false, color: opts?.color ?? "#111111" }
+}
+
+export function button(title: string, onClick: () => void): View {
+  return { kind: "button", title, onClick }
+}
+
+export function column(children: View[], gap?: f64): View {
+  return { kind: "column", gap: gap ?? 0, children }
+}
+
+export function row(children: View[], gap?: f64): View {
+  return { kind: "row", gap: gap ?? 0, children }
+}
+
+export function pad(inset: f64, child: View): View {
+  return { kind: "pad", inset, child }
+}
+
+export function spacer(): View {
+  return { kind: "spacer" }
+}
+
+// --- layout ------------------------------------------------------------
+
+export type Size = { w: f64, h: f64 }
+export type Box = { x: f64, y: f64, w: f64, h: f64 }
+export type Hit = { box: Box, onClick: () => void }
+
+export type Cmd =
+  | { kind: "rect", x: f64, y: f64, w: f64, h: f64, color: string, radius: f64 }
+  | { kind: "text", x: f64, y: f64, w: f64, h: f64, s: string, size: f64, color: string, bold: bool }
+export type Frame = { frame: Cmd[] }
+
+// Rough text metrics for layout; the helper centers glyphs inside the
+// rect it is given, so only the box has to be about right.
+function textW(s: string, size: f64, bold: bool): f64 {
+  return s.chars().length * size * (bold ? 0.6 : 0.55)
+}
+
+export function measure(v: View): Size {
+  switch (v.kind) {
+    case "text":
+      return { w: textW(v.s, v.size, v.bold), h: v.size * 1.35 }
+    case "button":
+      return { w: textW(v.title, 15, false) + 32, h: 30 }
+    case "spacer":
+      return { w: 0, h: 0 }
+    case "pad": {
+      const s = measure(v.child)
+      return { w: s.w + v.inset * 2, h: s.h + v.inset * 2 }
+    }
+    case "column": {
+      let w = 0
+      let h = v.gap * (v.children.length - 1)
+      for (const c of v.children) {
+        const s = measure(c)
+        if (s.w > w) w = s.w
+        h += s.h
+      }
+      return { w, h }
+    }
+    case "row": {
+      let w = v.gap * (v.children.length - 1)
+      let h = 0
+      for (const c of v.children) {
+        const s = measure(c)
+        w += s.w
+        if (s.h > h) h = s.h
+      }
+      return { w, h }
+    }
+  }
+}
+
+// Lays `v` out inside `box`. Rows and columns center their stack on the
+// main axis and each child on the cross axis; spacers split leftover
+// space evenly.
+export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[]) {
+  switch (v.kind) {
+    case "text":
+      cmds.push({ kind: "text", x: box.x, y: box.y, w: box.w, h: box.h, s: v.s, size: v.size, color: v.color, bold: v.bold })
+      break
+    case "button": {
+      cmds.push({ kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: "#0a7aff", radius: 6.0 })
+      cmds.push({ kind: "text", x: box.x, y: box.y, w: box.w, h: box.h, s: v.title, size: 15.0, color: "#ffffff", bold: true })
+      hits.push({ box, onClick: v.onClick })
+      break
+    }
+    case "pad":
+      place(v.child, { x: box.x + v.inset, y: box.y + v.inset, w: box.w - v.inset * 2, h: box.h - v.inset * 2 }, &cmds, &hits)
+      break
+    case "spacer":
+      break
+    case "column": {
+      const sizes = v.children.map(measure)
+      let fixed = v.gap * (v.children.length - 1)
+      let spacers = 0
+      let j = 0
+      for (const c of v.children) {
+        fixed += sizes[j]!.h
+        if (c.kind === "spacer") spacers += 1
+        j += 1
+      }
+      const extra = Math.max(0, box.h - fixed)
+      const perSpacer = spacers > 0 ? extra / spacers : 0
+      let y = box.y + (spacers > 0 ? 0 : extra / 2)
+      let i = 0
+      for (const c of v.children) {
+        const s = sizes[i]!
+        const h = c.kind === "spacer" ? perSpacer : s.h
+        const w = Math.min(s.w, box.w)
+        place(c, { x: box.x + (box.w - w) / 2, y, w, h }, &cmds, &hits)
+        y += h + v.gap
+        i += 1
+      }
+      break
+    }
+    case "row": {
+      const sizes = v.children.map(measure)
+      let fixed = v.gap * (v.children.length - 1)
+      let spacers = 0
+      let j = 0
+      for (const c of v.children) {
+        fixed += sizes[j]!.w
+        if (c.kind === "spacer") spacers += 1
+        j += 1
+      }
+      const extra = Math.max(0, box.w - fixed)
+      const perSpacer = spacers > 0 ? extra / spacers : 0
+      let x = box.x + (spacers > 0 ? 0 : extra / 2)
+      let i = 0
+      for (const c of v.children) {
+        const s = sizes[i]!
+        const w = c.kind === "spacer" ? perSpacer : s.w
+        const h = Math.min(s.h, box.h)
+        place(c, { x, y: box.y + (box.h - h) / 2, w, h }, &cmds, &hits)
+        x += w + v.gap
+        i += 1
+      }
+      break
+    }
+  }
+}
+
+export function layout(v: View, w: f64, h: f64): { frame: Frame, hits: Hit[] } {
+  let cmds: Cmd[] = []
+  let hits: Hit[] = []
+  place(v, { x: 0, y: 0, w, h }, &cmds, &hits)
+  return { frame: { frame: cmds }, hits }
+}
+
+// --- window shim -------------------------------------------------------
+//
+// argv: <title> <width> <height>
+// stdin:  {"frame":[cmd,...]} one JSON object per line; cmd is
+//         {"kind":"rect",x,y,w,h,color,radius} or {"kind":"text",x,y,w,h,s,size,color,bold}
+// stdout: {"event":"mousedown","x":..,"y":..} / {"event":"resize","w":..,"h":..}
+// The view is flipped, so all coordinates are top-left origin.
+// env MYTOV_CLICK="x,y" posts a synthetic mousedown ~0.7s after launch.
+
+const HELPER_SRC = `#import <Cocoa/Cocoa.h>
+
+static void emit(const char *s) {
+  fputs(s, stdout);
+  fputc('\\n', stdout);
+  fflush(stdout);
+}
+
+static NSColor *color(NSString *hex) {
+  unsigned r = 0, g = 0, b = 0;
+  const char *s = hex.UTF8String;
+  if (s[0] == '#') s++;
+  sscanf(s, "%02x%02x%02x", &r, &g, &b);
+  return [NSColor colorWithSRGBRed:r / 255.0 green:g / 255.0 blue:b / 255.0 alpha:1];
+}
+
+static double num(NSDictionary *d, NSString *k) { return [d[k] doubleValue]; }
+
+@interface ListView : NSView
+@property(nonatomic, strong) NSArray *displayList;
+@end
+
+static ListView *gView;
+
+@implementation ListView
+- (BOOL)isFlipped { return YES; }
+- (void)drawRect:(NSRect)dirty {
+  [[NSColor whiteColor] setFill];
+  NSRectFill(dirty);
+  for (NSDictionary *cmd in self.displayList) {
+    NSString *kind = cmd[@"kind"];
+    if ([kind isEqualToString:@"rect"]) {
+      NSRect box = NSMakeRect(num(cmd, @"x"), num(cmd, @"y"), num(cmd, @"w"), num(cmd, @"h"));
+      [color(cmd[@"color"]) setFill];
+      double rad = num(cmd, @"radius");
+      if (rad > 0) [[NSBezierPath bezierPathWithRoundedRect:box xRadius:rad yRadius:rad] fill];
+      else NSRectFill(box);
+    }
+    if ([kind isEqualToString:@"text"]) {
+      NSRect box = NSMakeRect(num(cmd, @"x"), num(cmd, @"y"), num(cmd, @"w"), num(cmd, @"h"));
+      double size = num(cmd, @"size");
+      NSFont *font = [cmd[@"bold"] boolValue] ? [NSFont boldSystemFontOfSize:size]
+                                              : [NSFont systemFontOfSize:size];
+      NSMutableParagraphStyle *ps = [NSMutableParagraphStyle new];
+      ps.alignment = NSTextAlignmentCenter;
+      [cmd[@"s"] drawInRect:box withAttributes:@{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: color(cmd[@"color"]),
+        NSParagraphStyleAttributeName: ps,
+      }];
+    }
+  }
+}
+- (void)mouseDown:(NSEvent *)e {
+  NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+  char buf[256];
+  snprintf(buf, sizeof(buf), "{\\"event\\":\\"mousedown\\",\\"x\\":%g,\\"y\\":%g}", p.x, p.y);
+  emit(buf);
+}
+- (void)setFrameSize:(NSSize)size {
+  [super setFrameSize:size];
+  char buf[128];
+  snprintf(buf, sizeof(buf), "{\\"event\\":\\"resize\\",\\"w\\":%g,\\"h\\":%g}", size.width, size.height);
+  emit(buf);
+  [self setNeedsDisplay:YES];
+}
+@end
+
+@interface Delegate : NSObject <NSWindowDelegate>
+@end
+@implementation Delegate
+- (void)windowWillClose:(NSNotification *)note { [NSApp terminate:nil]; }
+@end
+
+// NSWindow.delegate is weak; keep it alive for the process.
+static Delegate *gDelegate;
+
+int main(int argc, const char *argv[]) {
+  @autoreleasepool {
+    NSString *title = argc > 1 ? [NSString stringWithUTF8String:argv[1]] : @"mytov";
+    double w = argc > 2 ? atof(argv[2]) : 480;
+    double h = argc > 3 ? atof(argv[3]) : 360;
+
+    [NSApplication sharedApplication];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+    NSWindow *win = [[NSWindow alloc]
+      initWithContentRect:NSMakeRect(0, 0, w, h)
+      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+      backing:NSBackingStoreBuffered
+      defer:NO];
+    win.title = title;
+    gDelegate = [Delegate new];
+    win.delegate = gDelegate;
+    [win center];
+
+    gView = [[ListView alloc] initWithFrame:win.contentView.bounds];
+    gView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [win.contentView addSubview:gView];
+
+    // Read display lists off stdin on a background thread.
+    [NSThread detachNewThreadWithBlock:^{
+      char *line = NULL;
+      size_t cap = 0;
+      while (getline(&line, &cap, stdin) > 0) {
+        NSData *d = [NSData dataWithBytes:line length:strlen(line)];
+        NSDictionary *msg = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        NSArray *frame = msg[@"frame"];
+        if (frame) {
+          dispatch_async(dispatch_get_main_queue(), ^{
+            gView.displayList = frame;
+            [gView setNeedsDisplay:YES];
+          });
+        }
+      }
+      // stdin closed: the Tov process is gone.
+      dispatch_async(dispatch_get_main_queue(), ^{ [NSApp terminate:nil]; });
+    }];
+
+    const char *click = getenv("MYTOV_CLICK");
+    if (click) {
+      double cx = 0, cy = 0;
+      sscanf(click, "%lf,%lf", &cx, &cy);
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), ^{
+        char buf[256];
+        snprintf(buf, sizeof(buf), "{\\"event\\":\\"mousedown\\",\\"x\\":%g,\\"y\\":%g}", cx, cy);
+        emit(buf);
+      });
+    }
+
+    [win makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+    [NSApp run];
+  }
+  return 0;
+}
+`
+
+function helperPath(): string {
+  const home = (process.env.HOME ?? process.env.USERPROFILE)!
+  const dir = path.join(home, ".cache", "mytov")
+  const src = path.join(dir, "mytov-window.m")
+  const bin = path.join(dir, "mytov-window")
+  const cached = existsSync(src) && try readFileSync(src, "utf8") === HELPER_SRC
+  if (existsSync(bin) && cached) return bin
+  try mkdirSync(dir, { recursive: true })
+  try writeFileSync(src, HELPER_SRC)
+  try execFileSync("clang", ["-fobjc-arc", "-O2", "-framework", "Cocoa", "-o", bin, src])
+  return bin
+}
+
+// --- run ---------------------------------------------------------------
+
+export type AppOptions = { title?: string, width?: int, height?: int, view: () => View }
+
+type Ev = { event: string, x?: f64, y?: f64, w?: f64, h?: f64 }
+
+let winW = 480.0
+let winH = 360.0
+let lastFrame = ""
+let lastHits: Hit[] = []
+let stdin: Js | undefined = undefined
+
+export function run(opts: AppOptions) throws Error | JsError {
+  winW = opts.width ?? 480
+  winH = opts.height ?? 360
+  const view = opts.view
+
+  const child = try spawn(helperPath(), [opts.title ?? "mytov", `${winW}`, `${winH}`], {
+    stdio: ["pipe", "pipe", "inherit"],
+  })
+  stdin = child.stdin
+
+  const rl = try createInterface({ input: child.stdout })
+  try rl.on("line", (line: Js) => {
+    try {
+      const ev = try JSON.parse(line as string) as Ev
+      if (ev.event === "mousedown" && ev.x !== undefined && ev.y !== undefined) {
+        const x = ev.x
+        const y = ev.y
+        for (const hit of lastHits) {
+          const b = hit.box
+          if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) {
+            hit.onClick()
+            break
+          }
+        }
+      } else if (ev.event === "resize" && ev.w !== undefined && ev.h !== undefined) {
+        winW = ev.w
+        winH = ev.h
+      }
+      try render(view)
+    } catch (e) {
+      console.error(`mytov: ${e.message}`)
+    }
+  })
+  try child.on("exit", () => process.exit(0))
+
+  try render(view)
+  // The event loop must stay alive for the helper's stdout lines (and JS
+  // callbacks generally) to be delivered; there is no server to hold it.
+  setInterval(() => {}, 50)
+}
+
+function render(view: () => View) {
+  const l = layout(view(), winW, winH)
+  lastHits = l.hits
+  const json = JSON.stringify(l.frame)
+  if (json !== lastFrame) {
+    lastFrame = json
+    try stdin!.write(json + "\n")
+  }
+}
