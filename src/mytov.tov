@@ -518,214 +518,6 @@ function helperPath(): string {
   return bin
 }
 
-// --- run ---------------------------------------------------------------
-
-export type AppOptions = { title?: string, width?: int, height?: int, view: () => View }
-
-// Event packets from the helper. `key` is charactersIgnoringModifiers,
-// `code` the macOS keyCode; mods is a bitmask (cmd 1, shift 2, alt 4, ctrl 8).
-type Ev = {
-  event: string,
-  x?: f64, y?: f64,
-  w?: f64, h?: f64,
-  dx?: f64, dy?: f64,
-  id?: int, scale?: f64,
-  key?: string, code?: int, mods?: int, repeat?: bool,
-}
-
-export const MOD_CMD = 1
-export const MOD_SHIFT = 2
-export const MOD_ALT = 4
-export const MOD_CTRL = 8
-
-let lastCmds: Cmd[] = []
-let winW = 480.0
-let winH = 360.0
-// Points, not pixels: every coordinate and text size is in points, and the
-// helper draws vectorially, so Retina output is automatic. winScale is the
-// window's backing factor, kept for when a view needs pixel alignment.
-let winScale = 1.0
-let lastFrame = ""
-let lastHits: Hit[] = []
-let stdin: Js | undefined = undefined
-let measureSeq = 0
-const measureKeys: Map<int, string> = new Map()
-const measureWaiters: Map<int, (s: Size) => void> = new Map()
-let hoverIdx = -1
-let pressedIdx = -1
-let focusIdx = -1
-let winFocused = false
-
-// Topmost hit region at a point (later entries draw on top).
-export function hitAt(x: f64, y: f64, hits: Hit[]): int {
-  for (let i = hits.length - 1; i >= 0; i -= 1) {
-    const b = hits[i]!.box
-    if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return i
-  }
-  return -1
-}
-
-function resolveMeasure(ev: Ev) {
-  if (ev.id === undefined || ev.w === undefined || ev.h === undefined) return
-  const key = measureKeys.get(ev.id)
-  if (key === undefined) return
-  const size = { w: ev.w, h: ev.h }
-  textCache.set(key, size)
-  inflight.delete(key)
-  const waiter = measureWaiters.get(ev.id)
-  if (waiter !== undefined) {
-    measureWaiters.delete(ev.id)
-    waiter(size)
-  }
-}
-
-const KEY_ENTER = 36
-const KEY_SPACE = 49
-const KEY_TAB = 48
-
-function nextFocusable(from: int, dir: int): int {
-  const n = lastHits.length
-  for (let step = 1; step <= n; step += 1) {
-    const i = ((from + dir * step) % n + n) % n
-    if (lastHits[i]!.on.focusable === true) return i
-  }
-  return -1
-}
-
-// Apply one helper event to window state. Returns true when a re-render is
-// warranted (state or damage changed); "measured" is handled separately.
-export function dispatchEvent(ev: Ev): bool {
-  const pt = ev.x !== undefined && ev.y !== undefined
-  switch (ev.event) {
-    case "mousedown":
-      pressedIdx = pt ? hitAt(ev.x!, ev.y!, lastHits) : -1
-      if (pressedIdx >= 0 && lastHits[pressedIdx]!.on.focusable === true) focusIdx = pressedIdx
-      return true
-    case "rightdown":
-      // Context menus land with desktop-menus; for now treat as a click.
-      pressedIdx = pt ? hitAt(ev.x!, ev.y!, lastHits) : -1
-      return true
-    case "mouseup": {
-      const was = pressedIdx
-      pressedIdx = -1
-      if (was >= 0 && pt && hitAt(ev.x!, ev.y!, lastHits) === was) {
-        const click = lastHits[was]!.on.click
-        if (click !== undefined) click()
-      }
-      return true
-    }
-    case "mousemove": {
-      const i = pt ? hitAt(ev.x!, ev.y!, lastHits) : -1
-      if (i === hoverIdx) return false
-      if (hoverIdx >= 0) {
-        const h = lastHits[hoverIdx]!.on.hover
-        if (h !== undefined) h(false)
-      }
-      hoverIdx = i
-      if (i >= 0) {
-        const h = lastHits[i]!.on.hover
-        if (h !== undefined) h(true)
-      }
-      return true
-    }
-    case "scroll": {
-      if (!pt) return false
-      for (let i = lastHits.length - 1; i >= 0; i -= 1) {
-        const h = lastHits[i]!
-        const b = h.box
-        const scroll = h.on.scroll
-        if (scroll !== undefined && ev.x! >= b.x && ev.x! < b.x + b.w && ev.y! >= b.y && ev.y! < b.y + b.h) {
-          scroll(ev.dx ?? 0, ev.dy ?? 0)
-          return true
-        }
-      }
-      return false
-    }
-    case "keydown": {
-      const ke: KeyEv = { code: ev.code ?? 0, key: ev.key ?? "", mods: ev.mods ?? 0, repeat: ev.repeat ?? false }
-      if (ke.code === KEY_TAB) {
-        focusIdx = nextFocusable(focusIdx, (ke.mods & MOD_SHIFT) !== 0 ? -1 : 1)
-        return true
-      }
-      const focused = focusIdx >= 0 && focusIdx < lastHits.length ? lastHits[focusIdx] : undefined
-      const keyHandler = focused?.on?.key
-      if (keyHandler !== undefined) {
-        keyHandler(ke)
-        return true
-      }
-      if ((ke.code === KEY_ENTER || ke.code === KEY_SPACE) && focused !== undefined) {
-        const click = focused.on.click
-        if (click !== undefined) click()
-        return true
-      }
-      return false
-    }
-    case "keyup": {
-      const focused = focusIdx >= 0 && focusIdx < lastHits.length ? lastHits[focusIdx] : undefined
-      const keyHandler = focused?.on?.key
-      if (keyHandler !== undefined) {
-        keyHandler({ code: ev.code ?? 0, key: ev.key ?? "", mods: ev.mods ?? 0, repeat: ev.repeat ?? false })
-        return true
-      }
-      return false
-    }
-    case "flags":
-      return false
-    case "focus":
-      winFocused = true
-      return false
-    case "blur":
-      winFocused = false
-      return true
-    case "resize":
-      winW = ev.w ?? winW
-      winH = ev.h ?? winH
-      winScale = ev.scale ?? winScale
-      return true
-  }
-  return false
-}
-
-export function run(opts: AppOptions) throws Error | JsError {
-  winW = opts.width ?? 480
-  winH = opts.height ?? 360
-  const view = opts.view
-
-  const child = try spawn(helperPath(), [opts.title ?? "mytov", `${winW}`, `${winH}`], {
-    stdio: ["pipe", "pipe", "inherit"],
-  })
-  stdin = child.stdin
-
-  const rl = try createInterface({ input: child.stdout })
-  const debug = process.env.MYTOV_DEBUG !== undefined
-  try rl.on("line", (line: Js) => {
-    if (debug) console.log(`window> ${line as string}`)
-    try {
-      const ev = try JSON.parse(line as string) as Ev
-      if (ev.event === "measured") {
-        resolveMeasure(ev)
-      } else if (dispatchEvent(ev)) {
-        render(view)
-      }
-    } catch (e) {
-      console.error(`mytov: ${e.message}`)
-    }
-  })
-  try child.on("exit", () => process.exit(0))
-
-  render(view)
-  // The event loop must stay alive for the helper's stdout lines (and JS
-  // callbacks generally) to be delivered; there is no server to hold it.
-  setInterval(() => {}, 50)
-}
-
-// Re-render after state may have changed. Runs as a detached task: measure
-// round-trips make it async, and channel errors are logged (a dead helper
-// means the process is on its way out anyway).
-export function cmdBox(c: Cmd): Box {
-  return { x: c.x, y: c.y, w: c.w, h: c.h }
-}
-
 // Rectangles the helper must repaint to go from `old` to `now`: the box of
 // every command that changed, moved, appeared, or vanished. The lists are
 // positionally stable for a stable tree shape, so index-wise diffing is
@@ -745,41 +537,288 @@ export function damageRects(old: Cmd[], now: Cmd[]): Box[] {
   return out
 }
 
-function render(view: () => View) {
-  renderFrame(view)
+export function cmdBox(c: Cmd): Box {
+  return { x: c.x, y: c.y, w: c.w, h: c.h }
 }
 
-async function renderFrame(view: () => View) {
-  try {
-    await renderPass(view)
-  } catch (e) {
-    console.error(`mytov: ${e.message}`)
+// Topmost hit region at a point (later entries draw on top).
+export function hitAt(x: f64, y: f64, hits: Hit[]): int {
+  for (let i = hits.length - 1; i >= 0; i -= 1) {
+    const b = hits[i]!.box
+    if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return i
+  }
+  return -1
+}
+
+// --- windows ----------------------------------------------------------
+
+// Event packets from the helper. `key` is charactersIgnoringModifiers,
+// `code` the macOS keyCode; mods is a bitmask (cmd 1, shift 2, alt 4, ctrl 8).
+type Ev = {
+  event: string,
+  x?: f64, y?: f64,
+  w?: f64, h?: f64,
+  dx?: f64, dy?: f64,
+  id?: int, scale?: f64,
+  key?: string, code?: int, mods?: int, repeat?: bool,
+}
+
+export const MOD_CMD = 1
+export const MOD_SHIFT = 2
+export const MOD_ALT = 4
+export const MOD_CTRL = 8
+
+const KEY_ENTER = 36
+const KEY_SPACE = 49
+const KEY_TAB = 48
+
+let measureSeq = 0
+const measureKeys: Map<int, string> = new Map()
+const measureWaiters: Map<int, (s: Size) => void> = new Map()
+
+let windows: Window[] = []
+let keepalive = false
+
+export type WindowOptions = { title?: string, width?: int, height?: int, view: () => View }
+
+// One window per helper process: own NSWindow, own pipe, own hit state.
+// The app exits when the last window closes.
+export class Window {
+  w = 480.0
+  h = 360.0
+  // Points, not pixels: every coordinate and text size is in points, and the
+  // helper draws vectorially, so Retina output is automatic. scale is the
+  // window's backing factor, kept for when a view needs pixel alignment.
+  scale = 1.0
+  hover = -1
+  pressed = -1
+  focus = -1
+  key = false
+  hits: Hit[] = []
+  lastCmds: Cmd[] = []
+  lastFrame = ""
+  stdin: Js | undefined
+  view: () => View
+
+  title = "mytov"
+
+  constructor(opts: WindowOptions) {
+    this.view = opts.view
+    this.w = opts.width ?? 480
+    this.h = opts.height ?? 360
+    this.title = opts.title ?? "mytov"
+  }
+
+  open() throws Error | JsError {
+    const child = try spawn(helperPath(), [this.title, `${this.w}`, `${this.h}`], {
+      stdio: ["pipe", "pipe", "inherit"],
+    })
+    this.stdin = child.stdin
+    const rl = try createInterface({ input: child.stdout })
+    const debug = process.env.MYTOV_DEBUG !== undefined
+    try rl.on("line", (line: Js) => {
+      if (debug) console.log(`window> ${line as string}`)
+      try {
+        const ev = try JSON.parse(line as string) as Ev
+        if (ev.event === "measured") {
+          resolveMeasure(ev)
+        } else if (this.dispatch(ev)) {
+          this.render()
+        }
+      } catch (e) {
+        console.error(`mytov: ${e.message}`)
+      }
+    })
+    try child.on("exit", () => {
+      windows = windows.filter((w) => w !== this)
+      if (windows.length === 0) process.exit(0)
+    })
+    this.render()
+    if (!keepalive) {
+      // The event loop must stay alive for the helpers' stdout lines (and JS
+      // callbacks generally) to be delivered; there is no server to hold it.
+      keepalive = true
+      setInterval(() => {}, 50)
+    }
+  }
+
+  hitAt(x: f64, y: f64): int {
+    for (let i = this.hits.length - 1; i >= 0; i -= 1) {
+      const b = this.hits[i]!.box
+      if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return i
+    }
+    return -1
+  }
+
+  nextFocusable(from: int, dir: int): int {
+    const n = this.hits.length
+    for (let step = 1; step <= n; step += 1) {
+      const i = ((from + dir * step) % n + n) % n
+      if (this.hits[i]!.on.focusable === true) return i
+    }
+    return -1
+  }
+
+  // Apply one helper event to this window's state. Returns true when a
+  // re-render is warranted.
+  dispatch(ev: Ev): bool {
+    const pt = ev.x !== undefined && ev.y !== undefined
+    switch (ev.event) {
+      case "mousedown":
+        this.pressed = pt ? this.hitAt(ev.x!, ev.y!) : -1
+        if (this.pressed >= 0 && this.hits[this.pressed]!.on.focusable === true) this.focus = this.pressed
+        return true
+      case "rightdown":
+        // Context menus land with desktop-menus; for now treat as a click.
+        this.pressed = pt ? this.hitAt(ev.x!, ev.y!) : -1
+        return true
+      case "mouseup": {
+        const was = this.pressed
+        this.pressed = -1
+        if (was >= 0 && pt && this.hitAt(ev.x!, ev.y!) === was) {
+          const click = this.hits[was]!.on.click
+          if (click !== undefined) click()
+        }
+        return true
+      }
+      case "mousemove": {
+        const i = pt ? this.hitAt(ev.x!, ev.y!) : -1
+        if (i === this.hover) return false
+        if (this.hover >= 0) {
+          const h = this.hits[this.hover]!.on.hover
+          if (h !== undefined) h(false)
+        }
+        this.hover = i
+        if (i >= 0) {
+          const h = this.hits[i]!.on.hover
+          if (h !== undefined) h(true)
+        }
+        return true
+      }
+      case "scroll": {
+        if (!pt) return false
+        for (let i = this.hits.length - 1; i >= 0; i -= 1) {
+          const h = this.hits[i]!
+          const b = h.box
+          const scroll = h.on.scroll
+          if (scroll !== undefined && ev.x! >= b.x && ev.x! < b.x + b.w && ev.y! >= b.y && ev.y! < b.y + b.h) {
+            scroll(ev.dx ?? 0, ev.dy ?? 0)
+            return true
+          }
+        }
+        return false
+      }
+      case "keydown": {
+        const ke: KeyEv = { code: ev.code ?? 0, key: ev.key ?? "", mods: ev.mods ?? 0, repeat: ev.repeat ?? false }
+        if (ke.code === KEY_TAB) {
+          this.focus = this.nextFocusable(this.focus, (ke.mods & MOD_SHIFT) !== 0 ? -1 : 1)
+          return true
+        }
+        const focused = this.focus >= 0 && this.focus < this.hits.length ? this.hits[this.focus] : undefined
+        const keyHandler = focused?.on?.key
+        if (keyHandler !== undefined) {
+          keyHandler(ke)
+          return true
+        }
+        if ((ke.code === KEY_ENTER || ke.code === KEY_SPACE) && focused !== undefined) {
+          const click = focused.on.click
+          if (click !== undefined) click()
+          return true
+        }
+        return false
+      }
+      case "keyup": {
+        const focused = this.focus >= 0 && this.focus < this.hits.length ? this.hits[this.focus] : undefined
+        const keyHandler = focused?.on?.key
+        if (keyHandler !== undefined) {
+          keyHandler({ code: ev.code ?? 0, key: ev.key ?? "", mods: ev.mods ?? 0, repeat: ev.repeat ?? false })
+          return true
+        }
+        return false
+      }
+      case "flags":
+        return false
+      case "focus":
+        this.key = true
+        return false
+      case "blur":
+        this.key = false
+        return true
+      case "resize":
+        this.w = ev.w ?? this.w
+        this.h = ev.h ?? this.h
+        this.scale = ev.scale ?? this.scale
+        return true
+    }
+    return false
+  }
+
+  // Re-render after state may have changed. Detached task: measure
+  // round-trips make it async; channel errors are logged (a dead helper
+  // means the process is on its way out anyway).
+  render() {
+    this.renderFrame()
+  }
+
+  async renderFrame() {
+    try {
+      await this.renderPass()
+    } catch (e) {
+      console.error(`mytov: ${e.message}`)
+    }
+  }
+
+  async renderPass() throws Error {
+    const v = this.view()
+    let runs: TextRun[] = []
+    let seen: Set<string> = new Set()
+    collectRuns(v, &runs, &seen)
+    const waits: Promise<Size>[] = []
+    for (const r of runs) {
+      const id = measureSeq
+      measureSeq += 1
+      const key = textKey(r)
+      measureKeys.set(id, key)
+      inflight.add(key)
+      waits.push(new Promise<Size>((resolve) => measureWaiters.set(id, resolve)))
+      try this.stdin!.write(`{"measure":{"id":${id},"s":${JSON.stringify(r.s)},"size":${r.size},"bold":${r.bold}}}\n`)
+    }
+    try await Promise.all(waits)
+    const l = layout(v, this.w, this.h, { hover: this.hover, pressed: this.pressed, focus: this.key ? this.focus : -1 })
+    this.hits = l.hits
+    const json = JSON.stringify(l.frame)
+    if (json !== this.lastFrame) {
+      const damage = damageRects(this.lastCmds, l.frame.frame)
+      this.lastCmds = l.frame.frame
+      this.lastFrame = json
+      try this.stdin!.write(JSON.stringify({ frame: l.frame.frame, damage }) + "\n")
+    }
   }
 }
 
-async function renderPass(view: () => View) throws Error {
-  const v = view()
-  let runs: TextRun[] = []
-  let seen: Set<string> = new Set()
-  collectRuns(v, &runs, &seen)
-  const waits: Promise<Size>[] = []
-  for (const r of runs) {
-    const id = measureSeq
-    measureSeq += 1
-    const key = textKey(r)
-    measureKeys.set(id, key)
-    inflight.add(key)
-    waits.push(new Promise<Size>((resolve) => measureWaiters.set(id, resolve)))
-    try stdin!.write(`{"measure":{"id":${id},"s":${JSON.stringify(r.s)},"size":${r.size},"bold":${r.bold}}}\n`)
+function resolveMeasure(ev: Ev) {
+  if (ev.id === undefined || ev.w === undefined || ev.h === undefined) return
+  const key = measureKeys.get(ev.id)
+  if (key === undefined) return
+  const size = { w: ev.w, h: ev.h }
+  textCache.set(key, size)
+  inflight.delete(key)
+  const waiter = measureWaiters.get(ev.id)
+  if (waiter !== undefined) {
+    measureWaiters.delete(ev.id)
+    waiter(size)
   }
-  try await Promise.all(waits)
-  const l = layout(v, winW, winH, { hover: hoverIdx, pressed: pressedIdx, focus: winFocused ? focusIdx : -1 })
-  lastHits = l.hits
-  const json = JSON.stringify(l.frame)
-  if (json !== lastFrame) {
-    const damage = damageRects(lastCmds, l.frame.frame)
-    lastCmds = l.frame.frame
-    lastFrame = json
-    try stdin!.write(JSON.stringify({ frame: l.frame.frame, damage }) + "\n")
-  }
+}
+
+// Open a window. `view` is re-rendered after every input event; the frame
+// is sent only when it changed, with damage rects for partial repaint.
+export function newWindow(opts: WindowOptions): Window throws Error | JsError {
+  const win = new Window(opts)
+  try win.open()
+  windows.push(win)
+  return win
+}
+
+export function run(opts: WindowOptions) throws Error | JsError {
+  try newWindow(opts)
 }

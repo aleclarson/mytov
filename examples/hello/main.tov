@@ -1,4 +1,4 @@
-import { button, column, run, text } from "../../src/mytov"
+import { button, column, newWindow, pad, run, spacer, text } from "../../src/mytov"
 import type { View } from "../../src/mytov"
 
 class Counter {
@@ -20,4 +20,20 @@ function view(): View {
   )
 }
 
+function about(): View {
+  return pad(
+    24,
+    column(
+      [
+        text("mytov", { size: 24, bold: true }),
+        text("native UI from Tov"),
+        spacer(),
+        text("second window", { color: "#666666" }),
+      ],
+      8,
+    ),
+  )
+}
+
 try run({ title: "Counter", width: 480, height: 360, view })
+try newWindow({ title: "About", width: 300, height: 220, view: about })
