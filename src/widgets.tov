@@ -1,0 +1,226 @@
+import { animating, openUrl, textSize, tickCount } from "./mytov"
+import type { Box, Cmd, Hit, View, WidgetState } from "./mytov"
+
+// The standard widget set, built on the `custom` view kind: each widget is
+// a fixed-intrinsic-size view that paints primitive commands. Layout stays
+// in mytov.tov; this file only composes rects, ovals, and text.
+
+const ACCENT = "#0a7aff"
+const ACCENT_PRESS = "#045cc4"
+const FILL = "#e5e5ea"
+const LABEL = "#111111"
+const DIM = "#6e6e73"
+const RING = "#6bb3ff"
+const EDGE = "#c7c7cc"
+
+function rect(x: f64, y: f64, w: f64, h: f64, color: string, radius?: f64): Cmd {
+  return { kind: "rect", x, y, w, h, color, radius: radius ?? 0.0, stroke: "", lw: 0.0 }
+}
+
+function oval(x: f64, y: f64, w: f64, h: f64, color: string): Cmd {
+  return { kind: "oval", x, y, w, h, color }
+}
+
+function textCmd(s: string, x: f64, y: f64, w: f64, size: f64, bold: bool, color: string): Cmd {
+  return { kind: "text", x, y, w, h: textSize(s, size, bold).h, s, size, color, bold }
+}
+
+// Vertically centers a text run inside `h`.
+function vcenter(s: string, x: f64, y: f64, w: f64, h: f64, size: f64, bold: bool, color: string): Cmd {
+  const th = textSize(s, size, bold).h
+  return { kind: "text", x, y: y + (h - th) / 2, w, h: th, s, size, color, bold }
+}
+
+function focusRing(box: Box): Cmd {
+  return { kind: "rect", x: box.x - 2.0, y: box.y - 2.0, w: box.w + 4.0, h: box.h + 4.0, color: "", radius: 6.0, stroke: RING, lw: 2.0 }
+}
+
+export function toggle(value: bool, onChange: (v: bool) => void): View {
+  return {
+    kind: "custom", w: 38.0, h: 22.0,
+    on: { click: () => onChange(!value), focusable: true },
+    paint: (box, st) => {
+      let cmds: Cmd[] = [
+        rect(box.x, box.y, box.w, box.h, st.pressed ? ACCENT_PRESS : value ? ACCENT : FILL, 11.0),
+        oval(value ? box.x + box.w - 20.0 : box.x + 2.0, box.y + 2.0, 18.0, 18.0, "#ffffff"),
+      ]
+      if (st.focused) cmds.push(focusRing(box))
+      return cmds
+    },
+  }
+}
+
+export function checkbox(checked: bool, labelText: string, onChange: (v: bool) => void): View {
+  const tw = labelText === "" ? 0.0 : textSize(labelText, 13.0, false).w + 8.0
+  return {
+    kind: "custom", w: 18.0 + tw, h: 20.0,
+    on: { click: () => onChange(!checked), focusable: true },
+    paint: (box, st) => {
+      let cmds: Cmd[] = [rect(box.x, box.y + 1.0, 18.0, 18.0, checked ? (st.pressed ? ACCENT_PRESS : ACCENT) : "#ffffff", 4.0)]
+      if (!checked) cmds.push({ kind: "rect", x: box.x, y: box.y + 1.0, w: 18.0, h: 18.0, color: "", radius: 4.0, stroke: EDGE, lw: 1.0 })
+      if (checked) cmds.push(textCmd("✓", box.x, box.y + 2.0, 18.0, 13.0, true, "#ffffff"))
+      if (labelText !== "") cmds.push(textCmd(labelText, box.x + 26.0, box.y + 2.0, tw, 13.0, false, LABEL))
+      if (st.focused) cmds.push(focusRing(box))
+      return cmds
+    },
+  }
+}
+
+export function radio(selected: bool, labelText: string, onSelect: () => void): View {
+  const tw = labelText === "" ? 0.0 : textSize(labelText, 13.0, false).w + 8.0
+  return {
+    kind: "custom", w: 18.0 + tw, h: 20.0,
+    on: { click: () => onSelect(), focusable: true },
+    paint: (box, st) => {
+      let cmds: Cmd[] = [
+        oval(box.x, box.y + 1.0, 18.0, 18.0, "#ffffff"),
+        { kind: "rect", x: box.x, y: box.y + 1.0, w: 18.0, h: 18.0, color: "", radius: 9.0, stroke: EDGE, lw: 1.0 },
+      ]
+      if (selected) cmds.push(oval(box.x + 5.0, box.y + 6.0, 8.0, 8.0, ACCENT))
+      if (labelText !== "") cmds.push(textCmd(labelText, box.x + 26.0, box.y + 2.0, tw, 13.0, false, LABEL))
+      if (st.focused) cmds.push(focusRing(box))
+      return cmds
+    },
+  }
+}
+
+// Fraction slider; press and drag both set the value (captured pointer).
+export function slider(value: f64, onChange: (v: f64) => void): View {
+  return {
+    kind: "custom", w: 160.0, h: 20.0,
+    regions: (box) => [{
+      box,
+      on: {
+        focusable: true,
+        press: (x) => onChange(Math.max(0.0, Math.min(1.0, (x - box.x - 8.0) / (box.w - 16.0)))),
+        drag: (x) => onChange(Math.max(0.0, Math.min(1.0, (x - box.x - 8.0) / (box.w - 16.0)))),
+      },
+    }],
+    paint: (box, st) => {
+      const knobX = box.x + Math.max(0.0, Math.min(1.0, value)) * (box.w - 16.0)
+      const ky = box.y + box.h / 2 - 8.0
+      let cmds: Cmd[] = [
+        rect(box.x, box.y + box.h / 2 - 2.5, box.w, 5.0, FILL, 2.5),
+        rect(box.x, box.y + box.h / 2 - 2.5, knobX - box.x + 8.0, 5.0, ACCENT, 2.5),
+        oval(knobX, ky, 16.0, 16.0, "#ffffff"),
+        { kind: "rect", x: knobX, y: ky, w: 16.0, h: 16.0, color: "", radius: 8.0, stroke: st.pressed ? ACCENT : EDGE, lw: st.pressed ? 2.0 : 1.0 },
+      ]
+      if (st.focused) cmds.push(focusRing(box))
+      return cmds
+    },
+  }
+}
+
+export function segmented(options: string[], selected: int, onSelect: (i: int) => void): View {
+  const padX = 12.0
+  const segW = (i: int) => textSize(options[i]!, 13.0, false).w + padX * 2
+  let total = 0.0
+  for (let i = 0; i < options.length; i += 1) total += segW(i)
+  return {
+    kind: "custom", w: total, h: 26.0,
+    regions: (box) => {
+      let hits: Hit[] = []
+      let x = box.x
+      for (let i = 0; i < options.length; i += 1) {
+        const w = segW(i)
+        const idx = i
+        hits.push({ box: { x, y: box.y, w, h: box.h }, on: { click: () => onSelect(idx), focusable: true } })
+        x += w
+      }
+      return hits
+    },
+    paint: (box) => {
+      let cmds: Cmd[] = [rect(box.x, box.y, box.w, box.h, FILL, 6.0)]
+      let x = box.x
+      for (let i = 0; i < options.length; i += 1) {
+        const w = segW(i)
+        if (i === selected) cmds.push(rect(x + 2.0, box.y + 2.0, w - 4.0, box.h - 4.0, "#ffffff", 4.0))
+        cmds.push(vcenter(options[i]!, x, box.y, w, box.h, 13.0, false, i === selected ? LABEL : DIM))
+        x += w
+      }
+      return cmds
+    },
+  }
+}
+
+export function progress(value: f64): View {
+  const v = Math.max(0.0, Math.min(1.0, value))
+  return {
+    kind: "custom", w: 160.0, h: 6.0,
+    paint: (box) => [
+      rect(box.x, box.y, box.w, box.h, FILL, 3.0),
+      rect(box.x, box.y, box.w * v, box.h, ACCENT, 3.0),
+    ],
+  }
+}
+
+// Linear meter, colored by band: green to 0.6, yellow to 0.85, red above.
+export function meter(value: f64): View {
+  const v = Math.max(0.0, Math.min(1.0, value))
+  const color = v < 0.6 ? "#34c759" : v < 0.85 ? "#ffcc00" : "#ff3b30"
+  return {
+    kind: "custom", w: 160.0, h: 6.0,
+    paint: (box) => [
+      rect(box.x, box.y, box.w, box.h, FILL, 3.0),
+      rect(box.x, box.y, box.w * v, box.h, color, 3.0),
+    ],
+  }
+}
+
+// Eight dots fading around a circle; marks its window live for the pump.
+export function spinner(size?: f64): View {
+  const d = size ?? 20.0
+  return {
+    kind: "custom", w: d, h: d,
+    paint: (box) => {
+      animating()
+      const t = tickCount()
+      const r = d / 2 - 2.0
+      const cx = box.x + box.w / 2
+      const cy = box.y + box.h / 2
+      const digits = "0123456789abcdef".chars()
+      let cmds: Cmd[] = []
+      for (let i = 0; i < 8; i += 1) {
+        const phase = (i + t) % 8
+        const alpha = 40 + Math.trunc(215.0 * phase / 7)
+        const a = `${digits[Math.trunc(alpha / 16)]!}${digits[alpha % 16]!}`
+        const ang = i * 0.7853981634
+        cmds.push(oval(cx + r * Math.cos(ang) - 2.5, cy + r * Math.sin(ang) - 2.5, 5.0, 5.0, `#555555${a}`))
+      }
+      return cmds
+    },
+  }
+}
+
+export function badge(labelText: string, color?: string): View {
+  const tw = textSize(labelText, 11.0, true).w
+  const w = tw + 14.0
+  return {
+    kind: "custom", w, h: 18.0,
+    paint: (box) => [
+      rect(box.x, box.y, box.w, box.h, color ?? DIM, 9.0),
+      vcenter(labelText, box.x, box.y - 1.0, box.w, box.h, 11.0, true, "#ffffff"),
+    ],
+  }
+}
+
+export function link(labelText: string, url: string): View {
+  const s = textSize(labelText, 13.0, false)
+  return {
+    kind: "custom", w: s.w, h: s.h,
+    on: {
+      click: () => {
+        try {
+          openUrl(url)
+        } catch (e) {
+          console.error(`mytov link: ${e.message}`)
+        }
+      },
+    },
+    paint: (box, st) => {
+      let cmds: Cmd[] = [textCmd(labelText, box.x, box.y, box.w, 13.0, false, st.hover ? ACCENT_PRESS : ACCENT)]
+      if (st.hover) cmds.push(rect(box.x, box.y + box.h - 1.0, box.w, 1.0, ACCENT))
+      return cmds
+    },
+  }
+}

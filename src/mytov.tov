@@ -16,6 +16,11 @@ export type KeyEv = { code: int, key: string, mods: int, repeat: bool }
 // region in the Tab chain; a focused region gets key events first.
 export type Handlers = {
   click?: () => void,
+  // press fires on mousedown and drag on pointer moves while pressed,
+  // with the point in view coordinates — both stay captured by the hit
+  // region until mouseup, wherever the pointer goes.
+  press?: (x: f64, y: f64) => void,
+  drag?: (x: f64, y: f64) => void,
   hover?: (hovering: bool) => void,
   scroll?: (dx: f64, dy: f64) => void,
   key?: (e: KeyEv) => void,
@@ -26,6 +31,7 @@ export type View =
   | { kind: "text", s: string, size: f64, bold: bool, color: string }
   | { kind: "button", title: string, onClick: () => void }
   | { kind: "events", child: View, on: Handlers }
+  | { kind: "custom", w: f64, h: f64, paint: (box: Box, st: WidgetState) => Cmd[], on?: Handlers, regions?: (box: Box) => Hit[] }
   | { kind: "column", gap: f64, children: View[] }
   | { kind: "row", gap: f64, children: View[] }
   | { kind: "pad", inset: f64, child: View }
@@ -71,6 +77,7 @@ export type Hit = { box: Box, on: Handlers }
 
 export type Cmd =
   | { kind: "rect", x: f64, y: f64, w: f64, h: f64, color: string, radius: f64, stroke: string, lw: f64 }
+  | { kind: "oval", x: f64, y: f64, w: f64, h: f64, color: string }
   | { kind: "text", x: f64, y: f64, w: f64, h: f64, s: string, size: f64, color: string, bold: bool }
 export type Frame = { frame: Cmd[] }
 
@@ -86,7 +93,9 @@ function textKey(r: TextRun): string {
   return `${r.s}${r.size}${r.bold}`
 }
 
-function textSize(s: string, size: f64, bold: bool): Size {
+// CoreText size when the render pass has warmed the cache, otherwise the
+// estimate. Views laid out through run() always get the real number.
+export function textSize(s: string, size: f64, bold: bool): Size {
   return textCache.get(`${s}${size}${bold}`) ?? { w: s.chars().length * size * (bold ? 0.6 : 0.55), h: size * 1.35 }
 }
 
@@ -117,6 +126,8 @@ function collectRuns(v: View, inout out: TextRun[], inout seen: Set<string>) {
     case "events":
       collectRuns(v.child, &out, &seen)
       break
+    case "custom":
+      break
     case "column":
     case "row":
       for (const c of v.children) collectRuns(c, &out, &seen)
@@ -140,6 +151,8 @@ export function measure(v: View): Size {
     }
     case "events":
       return measure(v.child)
+    case "custom":
+      return { w: v.w, h: v.h }
     case "column": {
       let w = 0
       let h = v.gap * (v.children.length - 1)
@@ -168,6 +181,9 @@ export function measure(v: View): Size {
 // trees are rebuilt every render, so state is stable only while the tree
 // keeps the same shape.
 export type Styles = { hover: int, pressed: int, focus: int }
+
+// The state of a widget's own hit region, handed to paint.
+export type WidgetState = { hover: bool, pressed: bool, focused: bool }
 
 const NO_HIT: Styles = { hover: -1, pressed: -1, focus: -1 }
 
@@ -198,6 +214,18 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[], s
       hits.push({ box, on: v.on })
       place(v.child, box, &cmds, &hits, st)
       break
+    case "custom": {
+      const idx = hits.length
+      const ws: WidgetState = { hover: style.hover === idx, pressed: style.pressed === idx, focused: style.focus === idx }
+      const regions = v.regions
+      if (regions !== undefined) {
+        for (const h of regions(box)) hits.push(h)
+      } else if (v.on !== undefined) {
+        hits.push({ box, on: v.on! })
+      }
+      for (const c of v.paint(box, ws)) cmds.push(c)
+      break
+    }
     case "pad":
       place(v.child, { x: box.x + v.inset, y: box.y + v.inset, w: box.w - v.inset * 2, h: box.h - v.inset * 2 }, &cmds, &hits, st)
       break
@@ -292,11 +320,12 @@ static NSFont *fontFor(NSDictionary *d) {
 }
 
 static NSColor *color(NSString *hex) {
-  unsigned r = 0, g = 0, b = 0;
+  unsigned r = 0, g = 0, b = 0, a = 255;
   const char *s = hex.UTF8String;
   if (s[0] == '#') s++;
-  sscanf(s, "%02x%02x%02x", &r, &g, &b);
-  return [NSColor colorWithSRGBRed:r / 255.0 green:g / 255.0 blue:b / 255.0 alpha:1];
+  if (strlen(s) == 8) sscanf(s, "%02x%02x%02x%02x", &r, &g, &b, &a);
+  else sscanf(s, "%02x%02x%02x", &r, &g, &b);
+  return [NSColor colorWithSRGBRed:r / 255.0 green:g / 255.0 blue:b / 255.0 alpha:a / 255.0];
 }
 
 static double num(NSDictionary *d, NSString *k) { return [d[k] doubleValue]; }
@@ -326,6 +355,11 @@ static ListView *gView;
         path.lineWidth = num(cmd, @"lw") > 0 ? num(cmd, @"lw") : 1.0;
         [path stroke];
       }
+    }
+    if ([kind isEqualToString:@"oval"]) {
+      NSRect box = NSMakeRect(num(cmd, @"x"), num(cmd, @"y"), num(cmd, @"w"), num(cmd, @"h"));
+      [color(cmd[@"color"]) setFill];
+      [[NSBezierPath bezierPathWithOvalInRect:box] fill];
     }
     if ([kind isEqualToString:@"text"]) {
       NSRect box = NSMakeRect(num(cmd, @"x"), num(cmd, @"y"), num(cmd, @"w"), num(cmd, @"h"));
@@ -465,6 +499,13 @@ int main(int argc, const char *argv[]) {
             }
           });
         }
+        NSString *open = msg[@"open"];
+        if (open) {
+          NSURL *u = [NSURL URLWithString:open];
+          if (u) dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSWorkspace sharedWorkspace] openURL:u];
+          });
+        }
         NSDictionary *m = msg[@"measure"];
         if (m) {
           NSSize sz = [m[@"s"] sizeWithAttributes:@{NSFontAttributeName: fontFor(m)}];
@@ -578,6 +619,28 @@ const measureWaiters: Map<int, (s: Size) => void> = new Map()
 
 let windows: Window[] = []
 let keepalive = false
+// Set by layout when a spinner is placed; renderPass marks the window
+// "live" so the pump keeps re-rendering it.
+let spinnerSeen = false
+let tick = 0
+
+// Call in a custom view's paint when it animates; its window then
+// re-renders on every pump tick.
+export function animating() {
+  spinnerSeen = true
+}
+
+// The animation pump's counter: ~80ms per step while a window is live.
+export function tickCount(): int {
+  return tick
+}
+
+// Open a URL in the default browser (routed through any live helper).
+export function openUrl(url: string) throws Error {
+  const w = windows[0]
+  if (w === undefined) return
+  try w.stdin!.write(`{"open":${JSON.stringify(url)}}\n`)
+}
 
 export type WindowOptions = { title?: string, width?: int, height?: int, view: () => View }
 
@@ -599,6 +662,7 @@ export class Window {
   lastFrame = ""
   stdin: Js | undefined
   view: () => View
+  live = false
 
   title = "mytov"
 
@@ -637,8 +701,15 @@ export class Window {
     if (!keepalive) {
       // The event loop must stay alive for the helpers' stdout lines (and JS
       // callbacks generally) to be delivered; there is no server to hold it.
+      // The tick also drives animated widgets (a window is live while its
+      // last render placed one).
       keepalive = true
-      setInterval(() => {}, 50)
+      setInterval(() => {
+        tick += 1
+        for (const w of windows) {
+          if (w.live) w.render()
+        }
+      }, 80)
     }
   }
 
@@ -664,10 +735,16 @@ export class Window {
   dispatch(ev: Ev): bool {
     const pt = ev.x !== undefined && ev.y !== undefined
     switch (ev.event) {
-      case "mousedown":
+      case "mousedown": {
         this.pressed = pt ? this.hitAt(ev.x!, ev.y!) : -1
-        if (this.pressed >= 0 && this.hits[this.pressed]!.on.focusable === true) this.focus = this.pressed
+        if (this.pressed >= 0) {
+          const h = this.hits[this.pressed]!.on
+          if (h.focusable === true) this.focus = this.pressed
+          const press = h.press
+          if (press !== undefined) press(ev.x!, ev.y!)
+        }
         return true
+      }
       case "rightdown":
         // Context menus land with desktop-menus; for now treat as a click.
         this.pressed = pt ? this.hitAt(ev.x!, ev.y!) : -1
@@ -682,6 +759,13 @@ export class Window {
         return true
       }
       case "mousemove": {
+        if (this.pressed >= 0 && this.pressed < this.hits.length) {
+          const drag = this.hits[this.pressed]!.on.drag
+          if (drag !== undefined && pt) {
+            drag(ev.x!, ev.y!)
+            return true
+          }
+        }
         const i = pt ? this.hitAt(ev.x!, ev.y!) : -1
         if (i === this.hover) return false
         if (this.hover >= 0) {
@@ -784,7 +868,9 @@ export class Window {
       try this.stdin!.write(`{"measure":{"id":${id},"s":${JSON.stringify(r.s)},"size":${r.size},"bold":${r.bold}}}\n`)
     }
     try await Promise.all(waits)
+    spinnerSeen = false
     const l = layout(v, this.w, this.h, { hover: this.hover, pressed: this.pressed, focus: this.key ? this.focus : -1 })
+    this.live = spinnerSeen
     this.hits = l.hits
     const json = JSON.stringify(l.frame)
     if (json !== this.lastFrame) {

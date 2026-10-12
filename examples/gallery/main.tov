@@ -1,0 +1,41 @@
+import { column, pad, row, run, spacer, text } from "../../src/mytov"
+import type { View } from "../../src/mytov"
+import { badge, checkbox, link, meter, progress, radio, segmented, slider, spinner, toggle } from "../../src/widgets"
+
+class State {
+  wifi = true
+  dark = false
+  choice = 0
+  volume = 0.4
+  seg = 0
+  loading = true
+}
+
+const s = new State()
+
+function labeled(labelText: string, child: View): View {
+  return row([text(labelText, { color: "#6e6e73" }), spacer(), child], 12)
+}
+
+function view(): View {
+  return pad(
+    24,
+    column(
+      [
+        row([text("mytov widgets", { size: 22, bold: true }), spacer(), badge("beta", "#ff9500")]),
+        labeled("Wi-Fi", toggle(s.wifi, (v) => { s.wifi = v })),
+        labeled("Notifications", checkbox(s.dark, "Enabled", (v) => { s.dark = v })),
+        labeled("Pick one", column([radio(s.choice === 0, "First", () => { s.choice = 0 }), radio(s.choice === 1, "Second", () => { s.choice = 1 })], 6)),
+        labeled("Volume", slider(s.volume, (v) => { s.volume = v })),
+        segmented(["Day", "Week", "Month"], s.seg, (i) => { s.seg = i }),
+        labeled("Progress", progress(s.volume)),
+        labeled("Load", meter(s.volume)),
+        row([spinner(20), text("loading…", { color: "#6e6e73" })], 8),
+        link("github.com/aleclarson/mytov", "https://github.com/aleclarson/mytov"),
+      ],
+      12,
+    ),
+  )
+}
+
+try run({ title: "Widgets", width: 440, height: 420, view })
