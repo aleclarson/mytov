@@ -1,5 +1,6 @@
-import { button, column, newWindow, onDeepLink, onOpenFile, pad, run, spacer, text } from "../../src/mytov"
+import { button, column, newWindow, onDeepLink, onOpenFile, pad, run, setMenus, spacer, text } from "../../src/mytov"
 import type { View } from "../../src/mytov"
+import { updateWindow } from "../../src/updater"
 
 class Counter {
   n = 0
@@ -39,3 +40,6 @@ onDeepLink((url) => console.log(`deeplink: ${url}`))
 onOpenFile((p) => console.log(`openfile: ${p}`))
 try run({ title: "Counter", width: 480, height: 360, view })
 try newWindow({ title: "About", width: 300, height: 220, view: about })
+try setMenus([
+  { title: "Hello", items: [{ label: "Check for Updates…", action: () => { try { updateWindow() } catch (e) {} } }] },
+])

@@ -1,0 +1,316 @@
+import { execFileSync, spawn } from "node:child_process"
+import { fetch } from "std/http"
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import * as path from "node:path"
+import { animating, button, column, newWindow, pad, row, spacer, text } from "./mytov"
+import type { View, Window } from "./mytov"
+import { progress, spinner } from "./widgets"
+
+// Signed auto-updates in the manner of Sparkle, matching mygo's model:
+// a per-platform manifest (update-darwin-<arch>.json) on an HTTPS feed
+// names the newest version, its release notes, and a tar.gz archive of
+// the .app with an Ed25519 signature. The app checks the manifest,
+// verifies the archive against the public key baked in at package time,
+// and swaps the bundle in place; the next launch (or relaunch()) runs
+// the new version. Deltas from the manifest are ignored — a spike can
+// always afford the full archive.
+
+export type UpdateConfig = {
+  // Directory URL holding update-<platform>.json, e.g.
+  // https://downloads.example.com/my-app
+  feedUrl: string,
+  // Ed25519 public key in PEM form, baked into the bundle by package.sh.
+  publicKey: string,
+  // The running app's version (CFBundleShortVersionString).
+  version: string,
+  // The .app being replaced.
+  bundle: string,
+}
+
+export type UpdateManifest = {
+  version: string,
+  notes?: string,
+  date?: string,
+  archive: { url: string, size: int, signature: string },
+}
+
+// The .app containing this executable: <bundle>/Contents/MacOS/<bin>.
+// undefined in `tov run` development.
+export function bundlePath(): string | undefined {
+  const macos = path.dirname(process.argv[0]!)
+  if (path.basename(macos) !== "MacOS") return undefined
+  const contents = path.dirname(macos)
+  if (path.basename(contents) !== "Contents") return undefined
+  const bundle = path.dirname(contents)
+  return bundle.endsWith(".app") ? bundle : undefined
+}
+
+// A plist value, or undefined when the key is absent.
+function plistValue(plist: string, key: string): string | undefined {
+  try {
+    const out = try execFileSync("/usr/libexec/PlistBuddy", ["-c", `Print:${key}`, plist])
+    return `${out as Js}`.trim()
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Update configuration baked into the bundle by package.sh: the feed URL
+// and version live in Info.plist, the public key in Resources/update.pub.
+export function updateConfig(): UpdateConfig | undefined {
+  const bundle = bundlePath()
+  if (bundle === undefined) return undefined
+  const plist = path.join(bundle, "Contents", "Info.plist")
+  const feedUrl = plistValue(plist, "MytovUpdateFeedURL")
+  const pubPath = path.join(bundle, "Contents", "Resources", "update.pub")
+  if (feedUrl === undefined || !existsSync(pubPath)) return undefined
+  let publicKey = ""
+  try {
+    publicKey = try readFileSync(pubPath, "utf8")
+  } catch (e) {
+    return undefined
+  }
+  return {
+    feedUrl,
+    publicKey,
+    version: plistValue(plist, "CFBundleShortVersionString") ?? "0.0.0",
+    bundle,
+  }
+}
+
+function canWrite(dir: string): bool {
+  const probe = path.join(dir, `.mytov-write-${process.argv.length}`)
+  try {
+    try writeFileSync(probe, "")
+    try rmSync(probe, { force: true })
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
+// Whether this install can self-update: packaged, configured, and the
+// bundle's directory is writable (an app in /Applications owned by an
+// administrator may not be).
+export function updatesEnabled(): bool {
+  const cfg = updateConfig()
+  return cfg !== undefined && canWrite(path.dirname(cfg.bundle))
+}
+
+// "1.2.10" > "1.2.9"; segments are numeric, missing ones count as 0.
+function versionNewer(a: string, b: string): bool {
+  const pa = a.split(".")
+  const pb = b.split(".")
+  const n = Math.max(pa.length, pb.length)
+  for (let i = 0; i < n; i += 1) {
+    const x = (i < pa.length ? parseInt(pa[i]!) : 0) ?? 0
+    const y = (i < pb.length ? parseInt(pb[i]!) : 0) ?? 0
+    if (x !== y) return x > y
+  }
+  return false
+}
+
+function platform(): string throws Error {
+  const arch = `${try execFileSync("uname", ["-m"]) as Js}`.trim()
+  return `darwin-${arch}`
+}
+
+function stripSlash(s: string): string {
+  return s.endsWith("/") ? s.slice(0, s.byteLength - 1) : s
+}
+
+function manifestUrl(feedUrl: string): string throws Error {
+  return `${stripSlash(feedUrl)}/update-${try platform()}.json`
+}
+
+function resolveUrl(feedUrl: string, url: string): string {
+  if (url.startsWith("http://") || url.startsWith("https://")) return url
+  return `${stripSlash(feedUrl)}/${url}`
+}
+
+// Fetch the feed manifest; returns the newer version's entry, or
+// undefined when the app is current (or newer than the feed).
+export async function checkForUpdates(cfg: UpdateConfig): Promise<UpdateManifest | undefined> throws Error | JsError {
+  const res = try await fetch(manifestUrl(cfg.feedUrl))
+  if (!res.ok) throw new Error(`update check failed: HTTP ${res.status}`)
+  const m = try await res.json() as UpdateManifest
+  if (!versionNewer(m.version, cfg.version)) return undefined
+  m.archive.url = resolveUrl(cfg.feedUrl, m.archive.url)
+  return m
+}
+
+function sh(cmd: string, args: string[]): string throws Error {
+  return `${try execFileSync(cmd, args) as Js}`.trim()
+}
+
+// Download url to dest, calling onProgress(bytesReceived) as it grows.
+// curl does the transfer; the file size is polled from the filesystem.
+async function download(url: string, dest: string, onProgress?: (n: int) => void): Promise<void> throws Error | JsError {
+  const curl = try spawn("curl", ["-fL", "-sS", "-o", dest, url], {
+    stdio: ["ignore", "ignore", "pipe"],
+  })
+  let err = ""
+  let done = false
+  let code = -1
+  try curl.stderr!.on("data", (d: Js) => { err += `${d as Js}` })
+  try curl.on("exit", (c: Js) => { done = true; code = c as int })
+  while (!done) {
+    if (onProgress !== undefined && existsSync(dest)) {
+      try {
+        onProgress(parseInt(sh("stat", ["-f", "%z", dest])) ?? 0)
+      } catch (e) {}
+    }
+    try await new Promise<void>((resolve) => setTimeout(() => resolve(), 150))
+  }
+  if (code !== 0) throw new Error(`download failed (curl ${code}): ${err.trim()}`)
+}
+
+// Download the archive, verify its Ed25519 signature against the baked-in
+// public key (openssl does the crypto — Tov's own bindings cover hashing
+// only), unpack it, and swap it for the running bundle. The running app
+// keeps its inodes; relaunch() starts the new version.
+export async function installUpdate(u: UpdateManifest, cfg: UpdateConfig, onProgress?: (n: int, total: int) => void): Promise<void> throws Error | JsError {
+  const parent = path.dirname(cfg.bundle)
+  const tmp = path.join(parent, `.mytov-update-${Math.floor(Math.random() * 1e9)}`)
+  try mkdirSync(tmp, { recursive: true })
+  try {
+    const archive = path.join(tmp, "update.tar.gz")
+    try await download(u.archive.url, archive, (n) => {
+      if (onProgress !== undefined) onProgress(n, u.archive.size)
+    })
+
+    const pub = path.join(tmp, "update.pub")
+    const sigb64 = path.join(tmp, "sig.b64")
+    const sig = path.join(tmp, "sig.bin")
+    try writeFileSync(pub, cfg.publicKey)
+    // openssl base64 -d silently yields nothing unless the input ends
+    // with a newline.
+    try writeFileSync(sigb64, `${u.archive.signature}\n`)
+    sh("openssl", ["base64", "-d", "-in", sigb64, "-out", sig])
+    try {
+      sh("openssl", ["pkeyutl", "-verify", "-pubin", "-inkey", pub, "-rawin", "-in", archive, "-sigfile", sig])
+    } catch (e) {
+      throw new Error("update signature invalid")
+    }
+
+    const stage = path.join(tmp, "stage")
+    try mkdirSync(stage, { recursive: true })
+    sh("tar", ["-xzf", archive, "-C", stage])
+    const unpacked = try readdirSync(stage)
+    if (unpacked.length !== 1 || !unpacked[0]!.endsWith(".app")) {
+      throw new Error("update archive does not contain a single .app")
+    }
+    const fresh = path.join(stage, unpacked[0]!)
+    const replaced = `${cfg.bundle}.replaced`
+    try rmSync(replaced, { recursive: true, force: true })
+    sh("mv", [cfg.bundle, replaced])
+    sh("mv", [fresh, cfg.bundle])
+    try rmSync(replaced, { recursive: true, force: true })
+  } catch (e) {
+    try rmSync(tmp, { recursive: true, force: true })
+    throw e
+  }
+  try rmSync(tmp, { recursive: true, force: true })
+}
+
+// Start the updated copy and exit this process.
+export function relaunch(cfg: UpdateConfig) throws Error | JsError {
+  const open = try spawn("open", ["-n", cfg.bundle], { stdio: ["ignore", "ignore", "ignore"] })
+  process.exit(0)
+}
+
+// --- update window ------------------------------------------------------
+
+class UpdateState {
+  // checking -> none | found -> downloading -> installing -> done | error
+  phase = "checking"
+  manifest: UpdateManifest | undefined = undefined
+  received = 0
+  total = 1
+  error = ""
+}
+
+const st = new UpdateState()
+let cfg: UpdateConfig | undefined = undefined
+let win: Window | undefined = undefined
+
+async function runCheck() {
+  try {
+    const m = try await checkForUpdates(cfg!)
+    st.manifest = m
+    st.phase = m === undefined ? "none" : "found"
+  } catch (e) {
+    st.error = e.message
+    st.phase = "error"
+  }
+  win?.render()
+}
+
+async function runInstall() {
+  st.phase = "downloading"
+  win?.render()
+  try {
+    try await installUpdate(st.manifest!, cfg!, (n, total) => {
+      st.received = n
+      st.total = Math.max(total, 1)
+    })
+    st.phase = "done"
+  } catch (e) {
+    st.error = e.message
+    st.phase = "error"
+  }
+  win?.render()
+}
+
+function updateView(): View {
+  switch (st.phase) {
+    case "checking":
+      return pad(20, column([row([spinner(14), text("Checking for updates…")], 8)], 10))
+    case "none":
+      return pad(20, column([text("You're up to date.", { bold: true }), text(`Version ${cfg!.version} is the newest.`, { color: "#666666" })], 10))
+    case "found": {
+      const m = st.manifest!
+      return pad(20, column([
+        text(`Version ${m.version} is available`, { size: 15, bold: true }),
+        text(`you have ${cfg!.version}`, { color: "#666666" }),
+        text(m.notes ?? "", { color: "#333333" }),
+        row([spacer(), button("Later", () => { try { win?.close() } catch (e) {} }), button("Install Update", () => { runInstall() })], 8),
+      ], 10))
+    }
+    case "downloading":
+      animating()
+      return pad(20, column([
+        text(`Downloading ${st.manifest!.version}…`, { bold: true }),
+        progress(st.received / st.total),
+        text(`${Math.floor(st.received / 1024)} KB of ${Math.floor(st.total / 1024)} KB`, { color: "#666666", size: 11 }),
+      ], 10))
+    case "installing":
+      return pad(20, column([row([spinner(14), text("Installing…")], 8)], 10))
+    case "done":
+      return pad(20, column([
+        text("Update installed", { bold: true }),
+        button("Relaunch", () => { try { relaunch(cfg!) } catch (e) {} }),
+      ], 10))
+    default:
+      return pad(20, column([
+        text("Update failed", { bold: true }),
+        text(st.error, { color: "#a00" }),
+        button("Close", () => { try { win?.close() } catch (e) {} }),
+      ], 10))
+  }
+}
+
+// The Sparkle-manner window: checks in the background, shows the new
+// version's notes, downloads with progress, verifies, swaps, relaunches.
+// No-op when the app cannot update (unpackaged, unsigned, read-only).
+export function updateWindow(cfgOverride?: UpdateConfig) throws Error | JsError {
+  const c = cfgOverride ?? updateConfig()
+  if (c === undefined) return
+  cfg = c
+  st.phase = "checking"
+  st.manifest = undefined
+  st.received = 0
+  st.error = ""
+  win = try newWindow({ title: "Software Update", width: 380, height: 200, view: updateView })
+  runCheck()
+}

@@ -953,6 +953,9 @@ int main(int argc, const char *argv[]) {
         if (menus) {
           dispatch_async(dispatch_get_main_queue(), ^{ buildMenus(menus, title); });
         }
+        if (msg[@"close"]) {
+          dispatch_async(dispatch_get_main_queue(), ^{ [win close]; });
+        }
         NSDictionary *cm = msg[@"contextMenu"];
         if (cm) {
           NSArray *items = cm[@"items"];
@@ -1275,6 +1278,12 @@ export class Window {
 
   hitAt(x: f64, y: f64): int {
     return hitAt(x, y, this.hits)
+  }
+
+  // Close the window; the helper process exits and the app exits when its
+  // last window closes.
+  close() throws Error {
+    try this.stdin!.write(`{"close":1}\n`)
   }
 
   nextFocusable(from: int, dir: int): int {
