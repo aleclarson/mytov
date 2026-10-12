@@ -55,10 +55,53 @@ export type Cmd =
   | { kind: "text", x: f64, y: f64, w: f64, h: f64, s: string, size: f64, color: string, bold: bool }
 export type Frame = { frame: Cmd[] }
 
-// Rough text metrics for layout; the helper centers glyphs inside the
-// rect it is given, so only the box has to be about right.
+// Text metrics. The render pass pre-measures every run through the helper
+// (CoreText) and caches by key; the estimate is the fallback for callers
+// that never warmed the cache, like tests.
+const textCache: Map<string, Size> = new Map()
+const inflight: Set<string> = new Set()
+
+type TextRun = { s: string, size: f64, bold: bool }
+
+function textKey(r: TextRun): string {
+  return `${r.s}${r.size}${r.bold}`
+}
+
+function textSize(s: string, size: f64, bold: bool): Size {
+  return textCache.get(`${s}${size}${bold}`) ?? { w: s.chars().length * size * (bold ? 0.6 : 0.55), h: size * 1.35 }
+}
+
 function textW(s: string, size: f64, bold: bool): f64 {
-  return s.chars().length * size * (bold ? 0.6 : 0.55)
+  return textSize(s, size, bold).w
+}
+
+function addRun(inout out: TextRun[], inout seen: Set<string>, s: string, size: f64, bold: bool) {
+  const k = textKey({ s, size, bold })
+  if (!seen.has(k) && !textCache.has(k) && !inflight.has(k)) {
+    seen.add(k)
+    out.push({ s, size, bold })
+  }
+}
+
+// Every text run a view tree will draw, deduplicated by cache key.
+function collectRuns(v: View, inout out: TextRun[], inout seen: Set<string>) {
+  switch (v.kind) {
+    case "text":
+      addRun(&out, &seen, v.s, v.size, v.bold)
+      break
+    case "button":
+      addRun(&out, &seen, v.title, 15.0, true)
+      break
+    case "pad":
+      collectRuns(v.child, &out, &seen)
+      break
+    case "column":
+    case "row":
+      for (const c of v.children) collectRuns(c, &out, &seen)
+      break
+    case "spacer":
+      break
+  }
 }
 
 export function measure(v: View): Size {
@@ -66,7 +109,7 @@ export function measure(v: View): Size {
     case "text":
       return { w: textW(v.s, v.size, v.bold), h: v.size * 1.35 }
     case "button":
-      return { w: textW(v.title, 15, false) + 32, h: 30 }
+      return { w: textW(v.title, 15.0, true) + 32, h: 30.0 }
     case "spacer":
       return { w: 0, h: 0 }
     case "pad": {
@@ -106,7 +149,8 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[]) {
       break
     case "button": {
       cmds.push({ kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: "#0a7aff", radius: 6.0 })
-      cmds.push({ kind: "text", x: box.x, y: box.y, w: box.w, h: box.h, s: v.title, size: 15.0, color: "#ffffff", bold: true })
+      const th = textSize(v.title, 15.0, true).h
+      cmds.push({ kind: "text", x: box.x, y: box.y + (box.h - th) / 2, w: box.w, h: th, s: v.title, size: 15.0, color: "#ffffff", bold: true })
       hits.push({ box, onClick: v.onClick })
       break
     }
@@ -190,6 +234,19 @@ static void emit(const char *s) {
   fflush(stdout);
 }
 
+static void emitJSON(NSDictionary *d) {
+  NSData *data = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
+  fwrite(data.bytes, 1, data.length, stdout);
+  fputc('\\n', stdout);
+  fflush(stdout);
+}
+
+static NSFont *fontFor(NSDictionary *d) {
+  double size = [d[@"size"] doubleValue];
+  return [d[@"bold"] boolValue] ? [NSFont boldSystemFontOfSize:size]
+                               : [NSFont systemFontOfSize:size];
+}
+
 static NSColor *color(NSString *hex) {
   unsigned r = 0, g = 0, b = 0;
   const char *s = hex.UTF8String;
@@ -222,9 +279,7 @@ static ListView *gView;
     }
     if ([kind isEqualToString:@"text"]) {
       NSRect box = NSMakeRect(num(cmd, @"x"), num(cmd, @"y"), num(cmd, @"w"), num(cmd, @"h"));
-      double size = num(cmd, @"size");
-      NSFont *font = [cmd[@"bold"] boolValue] ? [NSFont boldSystemFontOfSize:size]
-                                              : [NSFont systemFontOfSize:size];
+      NSFont *font = fontFor(cmd);
       NSMutableParagraphStyle *ps = [NSMutableParagraphStyle new];
       ps.alignment = NSTextAlignmentCenter;
       [cmd[@"s"] drawInRect:box withAttributes:@{
@@ -297,6 +352,14 @@ int main(int argc, const char *argv[]) {
             [gView setNeedsDisplay:YES];
           });
         }
+        NSDictionary *m = msg[@"measure"];
+        if (m) {
+          NSSize sz = [m[@"s"] sizeWithAttributes:@{NSFontAttributeName: fontFor(m)}];
+          emitJSON(@{ @"event": @"measured",
+                      @"id": m[@"id"],
+                      @"w": @(ceil(sz.width)),
+                      @"h": @(ceil(sz.height)) });
+        }
       }
       // stdin closed: the Tov process is gone.
       dispatch_async(dispatch_get_main_queue(), ^{ [NSApp terminate:nil]; });
@@ -339,13 +402,16 @@ function helperPath(): string {
 
 export type AppOptions = { title?: string, width?: int, height?: int, view: () => View }
 
-type Ev = { event: string, x?: f64, y?: f64, w?: f64, h?: f64 }
+type Ev = { event: string, x?: f64, y?: f64, w?: f64, h?: f64, id?: int }
 
 let winW = 480.0
 let winH = 360.0
 let lastFrame = ""
 let lastHits: Hit[] = []
 let stdin: Js | undefined = undefined
+let measureSeq = 0
+const measureKeys: Map<int, string> = new Map()
+const measureWaiters: Map<int, (s: Size) => void> = new Map()
 
 export function run(opts: AppOptions) throws Error | JsError {
   winW = opts.width ?? 480
@@ -374,22 +440,66 @@ export function run(opts: AppOptions) throws Error | JsError {
       } else if (ev.event === "resize" && ev.w !== undefined && ev.h !== undefined) {
         winW = ev.w
         winH = ev.h
+        render(view)
+      } else if (ev.event === "measured" && ev.id !== undefined && ev.w !== undefined && ev.h !== undefined) {
+        const key = measureKeys.get(ev.id)
+        if (key !== undefined) {
+          const size = { w: ev.w!, h: ev.h! }
+          textCache.set(key, size)
+          inflight.delete(key)
+          const waiter = measureWaiters.get(ev.id)
+          if (waiter !== undefined) {
+            measureWaiters.delete(ev.id)
+            waiter(size)
+          }
+        }
+      } else {
+        render(view)
       }
-      try render(view)
     } catch (e) {
       console.error(`mytov: ${e.message}`)
     }
   })
   try child.on("exit", () => process.exit(0))
 
-  try render(view)
+  render(view)
   // The event loop must stay alive for the helper's stdout lines (and JS
   // callbacks generally) to be delivered; there is no server to hold it.
   setInterval(() => {}, 50)
 }
 
+// Re-render after state may have changed. Runs as a detached task: measure
+// round-trips make it async, and channel errors are logged (a dead helper
+// means the process is on its way out anyway).
 function render(view: () => View) {
-  const l = layout(view(), winW, winH)
+  renderFrame(view)
+}
+
+async function renderFrame(view: () => View) {
+  try {
+    await renderPass(view)
+  } catch (e) {
+    console.error(`mytov: ${e.message}`)
+  }
+}
+
+async function renderPass(view: () => View) throws Error {
+  const v = view()
+  let runs: TextRun[] = []
+  let seen: Set<string> = new Set()
+  collectRuns(v, &runs, &seen)
+  const waits: Promise<Size>[] = []
+  for (const r of runs) {
+    const id = measureSeq
+    measureSeq += 1
+    const key = textKey(r)
+    measureKeys.set(id, key)
+    inflight.add(key)
+    waits.push(new Promise<Size>((resolve) => measureWaiters.set(id, resolve)))
+    try stdin!.write(`{"measure":{"id":${id},"s":${JSON.stringify(r.s)},"size":${r.size},"bold":${r.bold}}}\n`)
+  }
+  try await Promise.all(waits)
+  const l = layout(v, winW, winH)
   lastHits = l.hits
   const json = JSON.stringify(l.frame)
   if (json !== lastFrame) {

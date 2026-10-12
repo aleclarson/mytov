@@ -90,7 +90,12 @@ when you are certain the API change is expected and should become the new commit
 
 If the API drift is accidental, fix the source change instead of updating the snapshot. If intent is unclear, leave the snapshot unchanged and explain the uncertainty.
 
+## Environment
+
+- `tov` is installed and on PATH (`~/.cargo/bin/tov`); source clone at `~/dev/Tov` (`cargo install --path crates/tov` to update it).
+
 ## References
 
 - mygo (the framework being ported): https://github.com/egoist/mygo
 - Tov language spec (differences from TypeScript): https://raw.githubusercontent.com/richiemcilroy/Tov/refs/heads/main/docs/spec.md
+- Tov agent guide (llms.txt: spec + command usage): https://tov.sh/llms.txt
