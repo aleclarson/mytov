@@ -1,4 +1,4 @@
-import { ScrollState, button, column, list, on, pad, row, run, setMenus, setTray, showMenu, spacer, split, SplitState, text } from "../../src/mytov"
+import { ScrollState, button, column, list, on, openFile, pad, row, run, setMenus, setTray, showMenu, spacer, split, SplitState, text } from "../../src/mytov"
 import type { View } from "../../src/mytov"
 import { Field, badge, checkbox, drawer, input, link, menuAt, meter, modal, numberInput, progress, radio, searchField, segmented, slider, spinner, stepper, textarea, toast, toggle } from "../../src/widgets"
 
@@ -79,6 +79,11 @@ function view(): View {
 }
 
 try run({ title: "Widgets", width: 440, height: 420, view })
+async function openIt() {
+  const p = try await openFile()
+  if (p !== "") console.log(`picked: ${p}`)
+}
+
 try setTray({ title: "⚡", items: [{ label: "Toast it", action: () => { s.showToast = true } }] })
 try setMenus([
   {
@@ -87,6 +92,7 @@ try setMenus([
       { label: "Show Toast", shortcut: "cmd+t", action: () => { s.showToast = true } },
       { separator: true, label: "" },
       { label: "Close Drawer", shortcut: "cmd+shift+d", action: () => { s.drawerOpen = false } },
+      { label: "Open File…", shortcut: "cmd+o", action: () => { openIt() } },
     ],
   },
 ])

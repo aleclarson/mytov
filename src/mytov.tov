@@ -481,7 +481,7 @@ export function layout(v: View, w: f64, h: f64, st?: Styles): { frame: Frame, hi
 // The view is flipped, so all coordinates are top-left origin.
 // env MYTOV_CLICK="x,y" posts a synthetic mousedown ~0.7s after launch.
 
-const HELPER_SRC = `#import <Cocoa/Cocoa.h>
+const HELPER_SRC = `#import <Cocoa/Cocoa.h>\n#import <UserNotifications/UserNotifications.h>
 
 static void emit(const char *s) {
   fputs(s, stdout);
@@ -862,6 +862,56 @@ int main(int argc, const char *argv[]) {
             }
           });
         }
+        NSDictionary *dlg = msg[@"dialog"];
+        if (dlg) {
+          NSString *kind = dlg[@"kind"];
+          dispatch_async(dispatch_get_main_queue(), ^{
+            NSNumber *i = dlg[@"id"];
+            if ([kind isEqualToString:@"alert"]) {
+              NSAlert *a = [NSAlert new];
+              a.messageText = dlg[@"title"] ?: @"";
+              a.informativeText = dlg[@"body"] ?: @"";
+              for (NSString *b in dlg[@"buttons"] ?: @[]) [a addButtonWithTitle:b];
+              NSInteger r = [a runModal];
+              emitJSON(@{ @"event": @"dialog", @"id": i, @"s": @(r - NSAlertFirstButtonReturn).stringValue });
+            } else {
+              NSSavePanel *panel;
+              if ([kind isEqualToString:@"save"]) {
+                panel = [NSSavePanel savePanel];
+              } else {
+                NSOpenPanel *o = [NSOpenPanel openPanel];
+                o.canChooseDirectories = [dlg[@"dir"] boolValue];
+                o.allowsMultipleSelection = [dlg[@"multi"] boolValue];
+                panel = o;
+              }
+              if (dlg[@"title"]) panel.title = dlg[@"title"];
+              NSString *result = @"";
+              if ([panel runModal] == NSModalResponseOK) {
+                if ([panel isKindOfClass:[NSOpenPanel class]] && [dlg[@"multi"] boolValue]) {
+                  NSMutableArray *paths = [NSMutableArray array];
+                  for (NSURL *u in ((NSOpenPanel *)panel).URLs) [paths addObject:u.path];
+                  result = [paths componentsJoinedByString:@"\\n"];
+                } else {
+                  result = panel.URL.path ?: @"";
+                }
+              }
+              emitJSON(@{ @"event": @"dialog", @"id": i, @"s": result });
+            }
+          });
+        }
+        NSDictionary *ntf = msg[@"notify"];
+        if (ntf) {
+          dispatch_async(dispatch_get_main_queue(), ^{
+            // Requires a bundled app identity to actually display; from a
+            // bare process this is a no-op — packaging (seq 15) makes it real.
+            UNMutableNotificationContent *c = [UNMutableNotificationContent new];
+            c.title = ntf[@"title"] ?: @"";
+            c.body = ntf[@"body"] ?: @"";
+            UNNotificationRequest *req =
+              [UNNotificationRequest requestWithIdentifier:NSUUID.UUID.UUIDString content:c trigger:nil];
+            [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:req withCompletionHandler:nil];
+          });
+        }
         NSDictionary *m = msg[@"measure"];
         if (m) {
           NSSize sz = [m[@"s"] sizeWithAttributes:@{NSFontAttributeName: fontFor(m)}];
@@ -911,7 +961,7 @@ function helperPath(): string {
   if (existsSync(bin) && cached) return bin
   try mkdirSync(dir, { recursive: true })
   try writeFileSync(src, HELPER_SRC)
-  try execFileSync("clang", ["-fobjc-arc", "-O2", "-framework", "Cocoa", "-o", bin, src])
+  try execFileSync("clang", ["-fobjc-arc", "-O2", "-framework", "Cocoa", "-framework", "UserNotifications", "-o", bin, src])
   return bin
 }
 
@@ -1224,6 +1274,15 @@ export class Window {
         }
         return false
       }
+      case "dialog": {
+        const i = ev.id ?? -1
+        const waiter = dialogWaiters.get(i)
+        if (waiter !== undefined) {
+          dialogWaiters.delete(i)
+          waiter(ev.s ?? "")
+        }
+        return false
+      }
       case "menu": {
         const i = ev.i ?? -1
         const action = menuActions.get(i)
@@ -1372,6 +1431,46 @@ export function newWindow(opts: WindowOptions): Window throws Error | JsError {
 
 export function run(opts: WindowOptions) throws Error | JsError {
   try newWindow(opts)
+}
+
+// --- dialogs ------------------------------------------------------------
+
+let dialogSeq = 0
+const dialogWaiters: Map<int, (s: string) => void> = new Map()
+
+function dialogRequest(w: Window | undefined, body: string): Promise<string> throws Error {
+  const win = w ?? activeWindow ?? windows[0]
+  if (win === undefined) throw new Error("no window")
+  const id = dialogSeq
+  dialogSeq += 1
+  const p = new Promise<string>((resolve) => dialogWaiters.set(id, resolve))
+  try win.stdin!.write(`{"dialog":{"id":${id},${body}}}\n`)
+  return p
+}
+
+// NSOpenPanel; resolves to the chosen path, newline-joined paths when
+// multi, or "" on cancel.
+export function openFile(opts?: { dir?: bool, multi?: bool, title?: string }): Promise<string> throws Error {
+  const dir = (opts?.dir ?? false) ? "true" : "false"
+  const multi = (opts?.multi ?? false) ? "true" : "false"
+  const title = opts === undefined || opts.title === undefined ? "" : `,"title":${JSON.stringify(opts.title)}`
+  return try dialogRequest(undefined, `"kind":"open","dir":${dir},"multi":${multi}${title}`)
+}
+
+export function saveFile(opts?: { title?: string }): Promise<string> throws Error {
+  const title = opts === undefined || opts.title === undefined ? "" : `,"title":${JSON.stringify(opts.title)}`
+  return try dialogRequest(undefined, `"kind":"save"${title}`)
+}
+
+// NSAlert; resolves to the index of the pressed button.
+export function alert(title: string, body: string, buttons: string[]): Promise<string> throws Error {
+  return try dialogRequest(undefined, `"kind":"alert","title":${JSON.stringify(title)},"body":${JSON.stringify(body)},"buttons":${JSON.stringify(buttons)}`)
+}
+
+export function notify(title: string, body: string) throws Error {
+  const win = activeWindow ?? windows[0]
+  if (win === undefined) return
+  try win.stdin!.write(`{"notify":{"title":${JSON.stringify(title)},"body":${JSON.stringify(body)}}}\n`)
 }
 
 // --- menus --------------------------------------------------------------
