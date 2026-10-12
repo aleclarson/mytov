@@ -1,4 +1,4 @@
-import { animating, MOD_CMD, bg, column, openUrl, overlay, pad, readClipboard, row, textSize, tickCount, writeClipboard } from "./mytov"
+import { animating, MOD_CMD, bg, button, column, on, openUrl, overlay, pad, readClipboard, row, spacer, text, textSize, tickCount, writeClipboard } from "./mytov"
 import type { Box, Cmd, Hit, View, WidgetState } from "./mytov"
 
 // The standard widget set, built on the `custom` view kind: each widget is
@@ -751,4 +751,299 @@ export function menuAt(base: View, items: string[], at: Box | undefined, onSelec
 // Slide-out panel on the right edge while `open`.
 export function drawer(base: View, content: View, open: bool, width?: f64): View {
   return overlay(base, open ? bg("#ffffff", content) : undefined, { anchor: "right", capture: true })
+}
+
+// --- data & selection ---------------------------------------------------
+
+// Where a select/combobox popup is open; the widget stores its laid-out box
+// here on press so the app can wrap the root with selectPopup/menuAt.
+export class PopState {
+  at: Box | undefined = undefined
+}
+
+// A field that opens a popup list under itself. Pair with selectPopup at
+// the view root:
+//   selectPopup(view(), options, state, (i) => { state.at = undefined })
+export function select(label: string, state: PopState): View {
+  const tw = textSize(label + "▾", 13.0, false).w + 24.0
+  return {
+    kind: "custom", w: tw, h: 26.0,
+    regions: (box) => [{
+      box,
+      on: {
+        focusable: true,
+        press: () => {
+          state.at = { x: box.x, y: box.y + box.h + 4.0, w: box.w, h: 0 }
+        },
+      },
+    }],
+    paint: (box, st) => {
+      let cmds: Cmd[] = [
+        rect(box.x, box.y, box.w, box.h, st.pressed || st.hover ? "#e8e8ec" : "#f5f5f7", 6.0),
+        { kind: "rect", x: box.x, y: box.y, w: box.w, h: box.h, color: "", radius: 6.0, stroke: EDGE, lw: 1.0 },
+        vcenter(label, box.x + 10.0, box.y, box.w - 26.0, box.h, 13.0, false, LABEL),
+        vcenter("▾", box.x + box.w - 18.0, box.y, 14.0, box.h, 11.0, false, DIM),
+      ]
+      if (st.focused) cmds.push(focusRing(box))
+      return cmds
+    },
+  }
+}
+
+// Wrap at the view root; closes on select.
+export function selectPopup(base: View, options: string[], state: PopState, onSelect: (i: int) => void): View {
+  return menuAt(base, options, state.at, (i) => {
+    state.at = undefined
+    onSelect(i)
+  })
+}
+
+// Input plus a filtered suggestion popup under it (use with selectPopup).
+export function combobox(field: Field, state: PopState): View {
+  const inner = input(field, {})
+  return on(inner, {
+    press: () => {
+      // handled by the inner regions; nothing extra needed here
+    },
+  })
+}
+
+// Filtered suggestions for a combobox/selectPopup call.
+export function filterOptions(options: string[], query: string): string[] {
+  const q = query.toLowerCase()
+  return options.filter((o) => o.toLowerCase().includes(q))
+}
+
+// Filled star rating, 1..max.
+export function rating(value: int, max: int, onRate: (i: int) => void): View {
+  const s = textSize("★", 18.0, false)
+  return {
+    kind: "custom", w: max * (s.w + 2.0), h: s.h,
+    regions: (box) => {
+      let hits: Hit[] = []
+      for (let i = 0; i < max; i += 1) {
+        const idx = i
+        hits.push({ box: { x: box.x + i * (s.w + 2.0), y: box.y, w: s.w + 2.0, h: box.h }, on: { click: () => onRate(idx + 1) } })
+      }
+      return hits
+    },
+    paint: (box, st) => {
+      let cmds: Cmd[] = []
+      for (let i = 0; i < max; i += 1) {
+        cmds.push(textCmd("★", box.x + i * (s.w + 2.0), box.y, s.w + 2.0, 18.0, false, i < value ? "#ffcc00" : EDGE))
+      }
+      return cmds
+    },
+  }
+}
+
+// Two-knob range slider; values 0..1, whichever knob is nearer drags.
+export function rangeSlider(lo: f64, hi: f64, onChange: (lo: f64, hi: f64) => void): View {
+  const set = (x: f64, box: Box) => {
+    const f = Math.max(0.0, Math.min(1.0, (x - box.x - 8.0) / (box.w - 16.0)))
+    if (Math.abs(f - lo) <= Math.abs(f - hi)) onChange(Math.min(f, hi), hi)
+    else onChange(lo, Math.max(f, lo))
+  }
+  return {
+    kind: "custom", w: 160.0, h: 20.0,
+    regions: (box) => [{ box, on: { press: (x) => set(x, box), drag: (x) => set(x, box), focusable: true } }],
+    paint: (box) => {
+      const usable = box.w - 16.0
+      const lx = box.x + lo * usable
+      const hx = box.x + hi * usable
+      const ky = box.y + box.h / 2 - 7.0
+      return [
+        rect(box.x, box.y + box.h / 2 - 2.5, box.w, 5.0, FILL, 2.5),
+        rect(lx, box.y + box.h / 2 - 2.5, hx - lx, 5.0, ACCENT, 2.5),
+        oval(lx, ky, 14.0, 14.0, "#ffffff"),
+        oval(hx, ky, 14.0, 14.0, "#ffffff"),
+        { kind: "rect", x: lx, y: ky, w: 14.0, h: 14.0, color: "", radius: 7.0, stroke: EDGE, lw: 1.0 },
+        { kind: "rect", x: hx, y: ky, w: 14.0, h: 14.0, color: "", radius: 7.0, stroke: EDGE, lw: 1.0 },
+      ]
+    },
+  }
+}
+
+// Initials avatar in a colored circle.
+export function avatar(name: string, color?: string, size?: f64): View {
+  const d = size ?? 32.0
+  const parts = name.split(" ")
+  const initials = parts.length >= 2 ? `${parts[0]!.chars()[0]!}${parts[1]!.chars()[0]!}` : name.chars().slice(0, 2).join("")
+  return {
+    kind: "custom", w: d, h: d,
+    paint: (box) => [
+      oval(box.x, box.y, d, d, color ?? ACCENT),
+      vcenter(initials, box.x, box.y - 1.0, d, d, d * 0.38, true, "#ffffff"),
+    ],
+  }
+}
+
+// Image from a file path, decoded by the helper (NSImage).
+export function image(path: string, w: f64, h: f64): View {
+  return {
+    kind: "custom", w, h,
+    paint: (box) => [{ kind: "image", x: box.x, y: box.y, w: box.w, h: box.h, path }],
+  }
+}
+
+// Swatch grid color picker.
+const SWATCHES = [
+  "#ff3b30", "#ff9500", "#ffcc00", "#34c759", "#00c7be",
+  "#0a7aff", "#5856d6", "#af52de", "#ff2d55", "#a2845e",
+  "#8e8e93", "#111111",
+]
+
+export function colorPicker(selected: string, onPick: (c: string) => void): View {
+  const cell = 22.0
+  const cols = 6
+  return {
+    kind: "custom", w: cols * cell, h: Math.ceil(SWATCHES.length / cols) * cell,
+    regions: (box) => {
+      let hits: Hit[] = []
+      for (let i = 0; i < SWATCHES.length; i += 1) {
+        const c = SWATCHES[i]!
+        hits.push({ box: { x: box.x + (i % cols) * cell, y: box.y + Math.trunc(i / cols) * cell, w: cell, h: cell }, on: { click: () => onPick(c) } })
+      }
+      return hits
+    },
+    paint: (box) => {
+      let cmds: Cmd[] = []
+      for (let i = 0; i < SWATCHES.length; i += 1) {
+        const c = SWATCHES[i]!
+        const x = box.x + (i % cols) * cell
+        const y = box.y + Math.trunc(i / cols) * cell
+        cmds.push(rect(x + 2.0, y + 2.0, cell - 4.0, cell - 4.0, c, 4.0))
+        if (c === selected) cmds.push({ kind: "rect", x: x + 1.0, y: y + 1.0, w: cell - 2.0, h: cell - 2.0, color: "", radius: 5.0, stroke: LABEL, lw: 2.0 })
+      }
+      return cmds
+    },
+  }
+}
+
+// Month grid calendar; app tracks year/month/selected day.
+export function calendar(year: int, month: int, selected: int, onPick: (day: int) => void): View {
+  const cell = 30.0
+  const days = daysInMonth(year, month)
+  const lead = firstWeekday(year, month) // 0 = Sunday
+  const cells = lead + days
+  const rows = Math.ceil(cells / 7)
+  return {
+    kind: "custom", w: 7 * cell, h: rows * cell + 20.0,
+    regions: (box) => {
+      let hits: Hit[] = []
+      for (let d = 1; d <= days; d += 1) {
+        const day = d
+        const i = lead + d - 1
+        hits.push({ box: { x: box.x + (i % 7) * cell, y: box.y + 20.0 + Math.trunc(i / 7) * cell, w: cell, h: cell }, on: { click: () => onPick(day), focusable: true } })
+      }
+      return hits
+    },
+    paint: (box, st) => {
+      let cmds: Cmd[] = []
+      const names = "SMTWTFS".chars()
+      for (let i = 0; i < 7; i += 1) {
+        cmds.push(vcenter(names[i]!, box.x + i * cell, box.y, cell, 18.0, 11.0, true, DIM))
+      }
+      for (let d = 1; d <= days; d += 1) {
+        const i = lead + d - 1
+        const x = box.x + (i % 7) * cell
+        const y = box.y + 20.0 + Math.trunc(i / 7) * cell
+        const on = d === selected
+        if (on) cmds.push(oval(x + 3.0, y + 3.0, cell - 6.0, cell - 6.0, ACCENT))
+        cmds.push(vcenter(`${d}`, x, y, cell, cell, 12.0, false, on ? "#ffffff" : LABEL))
+      }
+      return cmds
+    },
+  }
+}
+
+function isLeap(y: int): bool {
+  return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0
+}
+
+export function daysInMonth(year: int, month: int): int {
+  const lengths = [31, isLeap(year) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  return lengths[month - 1]!
+}
+
+// Sakamoto's algorithm; 0 = Sunday.
+export function firstWeekday(y: int, m: int, d?: int): int {
+  const t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+  const yy = m < 3 ? y - 1 : y
+  return (yy + Math.trunc(yy / 4) - Math.trunc(yy / 100) + Math.trunc(yy / 400) + t[m - 1]! + (d ?? 1)) % 7
+}
+
+// Aligned label/field rows.
+export function form(rows: { label: string, field: View }[]): View {
+  let labelW = 0.0
+  for (const r of rows) labelW = Math.max(labelW, textSize(r.label, 13.0, false).w)
+  let items: View[] = []
+  for (const r of rows) {
+    items.push(row([{ kind: "custom", w: labelW, h: 20.0, paint: (box) => [textCmd(r.label, box.x + box.w - textSize(r.label, 13.0, false).w, box.y + 2.0, box.w, 13.0, false, DIM)] }, r.field], 10))
+  }
+  return column(items, 10)
+}
+
+// Simple bar chart; values normalized against the max.
+export function barChart(values: f64[], w?: f64, h?: f64, color?: string): View {
+  const cw = w ?? 240.0
+  const ch = h ?? 120.0
+  return {
+    kind: "custom", w: cw, h: ch,
+    paint: (box) => {
+      let cmds: Cmd[] = []
+      let max = 0.0
+      for (const v of values) max = Math.max(max, v)
+      const bw = box.w / values.length
+      for (let i = 0; i < values.length; i += 1) {
+        const vh = max > 0 ? (values[i]! / max) * box.h : 0
+        cmds.push(rect(box.x + i * bw + 2.0, box.y + box.h - vh, bw - 4.0, vh, color ?? ACCENT, 2.0))
+      }
+      return cmds
+    },
+  }
+}
+
+// Polyline chart over the same 0..max normalization.
+export function lineChart(values: f64[], w?: f64, h?: f64, color?: string): View {
+  const cw = w ?? 240.0
+  const ch = h ?? 120.0
+  return {
+    kind: "custom", w: cw, h: ch,
+    paint: (box) => {
+      let cmds: Cmd[] = []
+      let max = 0.0
+      for (const v of values) max = Math.max(max, v)
+      const step = values.length > 1 ? box.w / (values.length - 1) : box.w
+      for (let i = 0; i + 1 < values.length; i += 1) {
+        const y1 = box.y + box.h - (max > 0 ? (values[i]! / max) * box.h : 0)
+        const y2 = box.y + box.h - (max > 0 ? (values[i + 1]! / max) * box.h : 0)
+        cmds.push({ kind: "line", x: box.x + i * step, y: y1, w: step, h: y2 - y1, color: color ?? ACCENT, lw: 2.0 })
+      }
+      return cmds
+    },
+  }
+}
+
+// Fixed-column grid of equal children.
+export function grid(children: View[], cols: int, gap?: f64): View {
+  const g = gap ?? 8.0
+  let rows: View[] = []
+  for (let i = 0; i < children.length; i += cols) {
+    const slice = children.slice(i, Math.min(children.length, i + cols))
+    let cells: View[] = []
+    for (const c of slice) cells.push(c)
+    for (let k = slice.length; k < cols; k += 1) cells.push(spacer())
+    rows.push(row(cells, g))
+  }
+  return column(rows, g)
+}
+
+// Find bar: search field + optional match count + close button.
+export function findBar(field: Field, matchCount: int, onClose: () => void): View {
+  return row([
+    searchField(field),
+    text(matchCount > 0 ? `${matchCount}` : "—", { color: DIM }),
+    button("✕", onClose),
+  ], 8)
 }

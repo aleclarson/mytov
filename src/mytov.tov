@@ -133,6 +133,8 @@ export type Cmd =
   | { kind: "rect", x: f64, y: f64, w: f64, h: f64, color: string, radius: f64, stroke: string, lw: f64 }
   | { kind: "oval", x: f64, y: f64, w: f64, h: f64, color: string }
   | { kind: "text", x: f64, y: f64, w: f64, h: f64, s: string, size: f64, color: string, bold: bool }
+  | { kind: "image", x: f64, y: f64, w: f64, h: f64, path: string }
+  | { kind: "line", x: f64, y: f64, w: f64, h: f64, color: string, lw: f64 }
   | { kind: "pushClip", x: f64, y: f64, w: f64, h: f64 }
   | { kind: "popClip" }
 export type Frame = { frame: Cmd[] }
@@ -534,6 +536,19 @@ static ListView *gView;
     }
     if ([kind isEqualToString:@"popClip"]) {
       [NSGraphicsContext restoreGraphicsState];
+    }
+    if ([kind isEqualToString:@"image"]) {
+      NSImage *img = [[NSImage alloc] initWithContentsOfFile:cmd[@"path"]];
+      [img drawInRect:NSMakeRect(num(cmd, @"x"), num(cmd, @"y"), num(cmd, @"w"), num(cmd, @"h"))
+             fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1 respectFlipped:YES hints:nil];
+    }
+    if ([kind isEqualToString:@"line"]) {
+      NSBezierPath *p = [NSBezierPath bezierPath];
+      [p moveToPoint:NSMakePoint(num(cmd, @"x"), num(cmd, @"y"))];
+      [p lineToPoint:NSMakePoint(num(cmd, @"x") + num(cmd, @"w"), num(cmd, @"y") + num(cmd, @"h"))];
+      p.lineWidth = num(cmd, @"lw");
+      [color(cmd[@"color"]) setStroke];
+      [p stroke];
     }
     if ([kind isEqualToString:@"oval"]) {
       NSRect box = NSMakeRect(num(cmd, @"x"), num(cmd, @"y"), num(cmd, @"w"), num(cmd, @"h"));
