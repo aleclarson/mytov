@@ -1,4 +1,4 @@
-import { ScrollState, button, column, list, pad, row, run, spacer, split, SplitState, text } from "../../src/mytov"
+import { ScrollState, button, column, list, on, pad, row, run, setMenus, showMenu, spacer, split, SplitState, text } from "../../src/mytov"
 import type { View } from "../../src/mytov"
 import { Field, badge, checkbox, drawer, input, link, menuAt, meter, modal, numberInput, progress, radio, searchField, segmented, slider, spinner, stepper, textarea, toast, toggle } from "../../src/widgets"
 
@@ -62,7 +62,30 @@ function view(): View {
     button("Close", () => { s.showDialog = false }),
   ], 10), s.showDialog)
   const drw = drawer(dlg, column([text("Inspector", { bold: true }), text("side panel")], 8), s.drawerOpen, 220)
-  return toast(drw, "Saved", s.showToast)
+  return on(toast(drw, "Saved", s.showToast), {
+    rightClick: (x, y) => {
+      try {
+        showMenu([
+          { label: "First", action: () => console.log("menu: first") },
+          { label: "Second", action: () => console.log("menu: second") },
+          { separator: true, label: "" },
+          { label: "Third", action: () => console.log("menu: third") },
+        ], x, y)
+      } catch (e) {
+        console.error(`mytov menu: ${e.message}`)
+      }
+    },
+  })
 }
 
 try run({ title: "Widgets", width: 440, height: 420, view })
+try setMenus([
+  {
+    title: "Edit",
+    items: [
+      { label: "Show Toast", shortcut: "cmd+t", action: () => { s.showToast = true } },
+      { separator: true, label: "" },
+      { label: "Close Drawer", shortcut: "cmd+shift+d", action: () => { s.drawerOpen = false } },
+    ],
+  },
+])

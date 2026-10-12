@@ -21,6 +21,7 @@ export type Handlers = {
   // region until mouseup, wherever the pointer goes.
   press?: (x: f64, y: f64) => void,
   drag?: (x: f64, y: f64) => void,
+  rightClick?: (x: f64, y: f64) => void,
   hover?: (hovering: bool) => void,
   scroll?: (dx: f64, dy: f64) => void,
   key?: (e: KeyEv) => void,
@@ -700,6 +701,60 @@ static int mods(NSEvent *e) {
 }
 @end
 
+@interface MenuTarget : NSObject
+@end
+@implementation MenuTarget
+- (void)menuFired:(NSMenuItem *)item {
+  emitJSON(@{ @"event": @"menu", @"i": @(item.tag) });
+}
+@end
+
+static MenuTarget *gMenuTarget;
+
+static NSMenuItem *menuItemFor(NSDictionary *it) {
+  if ([it[@"separator"] boolValue]) return [NSMenuItem separatorItem];
+  // shortcut spec: "cmd+shift+k" — key is the last segment, lowercase.
+  NSString *key = @"";
+  NSUInteger mask = 0;
+  NSString *sc = it[@"shortcut"];
+  if (sc && sc.length) {
+    NSArray *parts = [[sc lowercaseString] componentsSeparatedByString:@"+"];
+    key = parts.lastObject;
+    for (NSString *p in parts) {
+      if ([p isEqualToString:@"cmd"]) mask |= NSEventModifierFlagCommand;
+      if ([p isEqualToString:@"shift"]) mask |= NSEventModifierFlagShift;
+      if ([p isEqualToString:@"alt"]) mask |= NSEventModifierFlagOption;
+      if ([p isEqualToString:@"ctrl"]) mask |= NSEventModifierFlagControl;
+    }
+  }
+  NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:it[@"label"] action:@selector(menuFired:) keyEquivalent:key];
+  item.keyEquivalentModifierMask = mask;
+  item.target = gMenuTarget;
+  item.tag = [it[@"i"] intValue];
+  if (it[@"enabled"] != nil) item.enabled = [it[@"enabled"] boolValue];
+  return item;
+}
+
+static void buildMenus(NSArray *menus, NSString *appName) {
+  NSMenu *main = [NSMenu new];
+  NSMenuItem *appItem = [NSMenuItem new];
+  NSMenu *appMenu = [NSMenu new];
+  NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:[@"Quit " stringByAppendingString:appName]
+                                                action:@selector(terminate:) keyEquivalent:@"q"];
+  quit.target = NSApp;
+  [appMenu addItem:quit];
+  appItem.submenu = appMenu;
+  [main addItem:appItem];
+  for (NSDictionary *m in menus) {
+    NSMenuItem *top = [[NSMenuItem alloc] initWithTitle:m[@"title"] action:nil keyEquivalent:@""];
+    NSMenu *sub = [[NSMenu alloc] initWithTitle:m[@"title"]];
+    for (NSDictionary *it in m[@"items"]) [sub addItem:menuItemFor(it)];
+    top.submenu = sub;
+    [main addItem:top];
+  }
+  NSApp.mainMenu = main;
+}
+
 @interface Delegate : NSObject <NSWindowDelegate>
 @end
 @implementation Delegate
@@ -777,6 +832,21 @@ int main(int argc, const char *argv[]) {
         if (setClip) {
           [[NSPasteboard generalPasteboard] clearContents];
           [[NSPasteboard generalPasteboard] setString:setClip forType:NSPasteboardTypeString];
+        }
+        NSArray *menus = msg[@"menus"];
+        if (menus) {
+          dispatch_async(dispatch_get_main_queue(), ^{ buildMenus(menus, title); });
+        }
+        NSDictionary *cm = msg[@"contextMenu"];
+        if (cm) {
+          NSArray *items = cm[@"items"];
+          dispatch_async(dispatch_get_main_queue(), ^{
+            NSMenu *m = [NSMenu new];
+            for (NSDictionary *it in items) [m addItem:menuItemFor(it)];
+            NSPoint p = NSMakePoint(num(cm, @"x"), num(cm, @"y"));
+            // NSMenu expects flipped-adjusted coords within the view.
+            [m popUpMenuPositioningItem:nil atLocation:p inView:gView];
+          });
         }
         NSDictionary *m = msg[@"measure"];
         if (m) {
@@ -1041,10 +1111,19 @@ export class Window {
         }
         return true
       }
-      case "rightdown":
-        // Context menus land with desktop-menus; for now treat as a click.
-        this.pressed = pt ? this.hitAt(ev.x!, ev.y!) : -1
-        return true
+      case "rightdown": {
+        if (!pt) return false
+        for (let i = this.hits.length - 1; i >= 0; i -= 1) {
+          const h = this.hits[i]!
+          if (h.clip !== undefined && !inBox(ev.x!, ev.y!, h.clip!)) continue
+          const rc = h.on.rightClick
+          if (rc !== undefined && inBox(ev.x!, ev.y!, h.box)) {
+            rc(ev.x!, ev.y!)
+            return true
+          }
+        }
+        return false
+      }
       case "mouseup": {
         const was = this.pressed
         this.pressed = -1
@@ -1129,6 +1208,12 @@ export class Window {
           handler(ev.event, ev.s ?? "")
           return true
         }
+        return false
+      }
+      case "menu": {
+        const i = ev.i ?? -1
+        const action = menuActions.get(i)
+        if (action !== undefined) action()
         return false
       }
       case "axpress": {
@@ -1273,4 +1358,53 @@ export function newWindow(opts: WindowOptions): Window throws Error | JsError {
 
 export function run(opts: WindowOptions) throws Error | JsError {
   try newWindow(opts)
+}
+
+// --- menus --------------------------------------------------------------
+
+export type MenuItem = {
+  label: string,
+  // "cmd+shift+k" style; cmd/shift/alt/ctrl.
+  shortcut?: string,
+  enabled?: bool,
+  separator?: bool,
+  action?: () => void,
+}
+
+export type MenuSpec = { title: string, items: MenuItem[] }
+
+const menuActions: Map<int, () => void> = new Map()
+let menuSeq = 0
+
+// Serializes menus, registering each action; shared by setMenus/showMenu.
+function menuPayload(items: MenuItem[]): { label: string, shortcut: string, enabled: bool, separator: bool, i: int }[] {
+  let out: { label: string, shortcut: string, enabled: bool, separator: bool, i: int }[] = []
+  for (const it of items) {
+    let i = -1
+    if (it.action !== undefined) {
+      i = menuSeq
+      menuSeq += 1
+      menuActions.set(i, it.action!)
+    }
+    out.push({ label: it.label, shortcut: it.shortcut ?? "", enabled: it.enabled ?? true, separator: it.separator ?? false, i })
+  }
+  return out
+}
+
+// Replaces the app menu bar in every window's helper (menus are app-global;
+// every helper gets the same bar so it stays consistent when focus moves
+// between windows).
+export function setMenus(menus: MenuSpec[]) throws Error {
+  let out: { title: string, items: { label: string, shortcut: string, enabled: bool, separator: bool, i: int }[] }[] = []
+  for (const m of menus) out.push({ title: m.title, items: menuPayload(m.items) })
+  const msg = `{"menus":${JSON.stringify(out)}}\n`
+  for (const w of windows) try w.stdin!.write(msg)
+}
+
+// Pops a context menu at a view-space point in a window (the app's
+// right-click handler is the usual caller).
+export function showMenu(items: MenuItem[], x: f64, y: f64, w?: Window) throws Error {
+  const win = w ?? activeWindow ?? windows[0]
+  if (win === undefined) return
+  try win.stdin!.write(`{"contextMenu":{"x":${x},"y":${y},"items":${JSON.stringify(menuPayload(items))}}}\n`)
 }
