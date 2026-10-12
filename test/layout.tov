@@ -1,4 +1,4 @@
-import { button, column, hitAt, layout, measure, text } from "../src/mytov"
+import { button, column, damageRects, hitAt, layout, measure, text } from "../src/mytov"
 
 test("column measures its children plus gaps", () => {
   const v = column([text("a"), text("bb")], 10)
@@ -50,4 +50,16 @@ test("pressed and focused buttons draw differently", () => {
   } else {
     expect(true).toBe(false)
   }
+})
+
+test("damageRects covers only changed commands", () => {
+  const v1 = column([text("0"), button("B", () => {})], 0)
+  const v2 = column([text("1"), button("B", () => {})], 0)
+  const a = layout(v1, 200, 100).frame.frame
+  const b = layout(v2, 200, 100).frame.frame
+  const dmg = damageRects(a, b)
+  expect(dmg.length).toBe(2) // old + new text box
+  expect(dmg[0]!.h).toBe(15 * 1.35)
+  const none = damageRects(a, a)
+  expect(none.length).toBe(0)
 })

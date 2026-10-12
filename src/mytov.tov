@@ -453,9 +453,16 @@ int main(int argc, const char *argv[]) {
         NSDictionary *msg = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
         NSArray *frame = msg[@"frame"];
         if (frame) {
+          NSArray *damage = msg[@"damage"];
           dispatch_async(dispatch_get_main_queue(), ^{
             gView.displayList = frame;
-            [gView setNeedsDisplay:YES];
+            if (damage) {
+              for (NSDictionary *d in damage) {
+                [gView setNeedsDisplayInRect:NSMakeRect(num(d, @"x"), num(d, @"y"), num(d, @"w"), num(d, @"h"))];
+              }
+            } else {
+              [gView setNeedsDisplay:YES];
+            }
           });
         }
         NSDictionary *m = msg[@"measure"];
@@ -531,6 +538,7 @@ export const MOD_SHIFT = 2
 export const MOD_ALT = 4
 export const MOD_CTRL = 8
 
+let lastCmds: Cmd[] = []
 let winW = 480.0
 let winH = 360.0
 // Points, not pixels: every coordinate and text size is in points, and the
@@ -714,6 +722,29 @@ export function run(opts: AppOptions) throws Error | JsError {
 // Re-render after state may have changed. Runs as a detached task: measure
 // round-trips make it async, and channel errors are logged (a dead helper
 // means the process is on its way out anyway).
+export function cmdBox(c: Cmd): Box {
+  return { x: c.x, y: c.y, w: c.w, h: c.h }
+}
+
+// Rectangles the helper must repaint to go from `old` to `now`: the box of
+// every command that changed, moved, appeared, or vanished. The lists are
+// positionally stable for a stable tree shape, so index-wise diffing is
+// exact; a length change damages the tail.
+export function damageRects(old: Cmd[], now: Cmd[]): Box[] {
+  let out: Box[] = []
+  const n = Math.max(old.length, now.length)
+  for (let i = 0; i < n; i += 1) {
+    const a = i < old.length ? old[i] : undefined
+    const b = i < now.length ? now[i] : undefined
+    const same = a !== undefined && b !== undefined && JSON.stringify(a) === JSON.stringify(b)
+    if (!same) {
+      if (a !== undefined) out.push(cmdBox(a))
+      if (b !== undefined) out.push(cmdBox(b))
+    }
+  }
+  return out
+}
+
 function render(view: () => View) {
   renderFrame(view)
 }
@@ -746,7 +777,9 @@ async function renderPass(view: () => View) throws Error {
   lastHits = l.hits
   const json = JSON.stringify(l.frame)
   if (json !== lastFrame) {
+    const damage = damageRects(lastCmds, l.frame.frame)
+    lastCmds = l.frame.frame
     lastFrame = json
-    try stdin!.write(json + "\n")
+    try stdin!.write(JSON.stringify({ frame: l.frame.frame, damage }) + "\n")
   }
 }
