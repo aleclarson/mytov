@@ -24,6 +24,8 @@ export type Handlers = {
   hover?: (hovering: bool) => void,
   scroll?: (dx: f64, dy: f64) => void,
   key?: (e: KeyEv) => void,
+  // Accessibility: role (AXRole, e.g. "AXButton") and label for VoiceOver.
+  ax?: { role: string, label: string },
   // Editing channel for text widgets: "insert" committed text,
   // "command" an editing selector name (e.g. moveLeft, deleteBackward),
   // "marked" IME preedit text, "paste" a clipboard reply.
@@ -96,6 +98,12 @@ export class SplitState {
 // Draggable two-pane row: left pane gets fraction of the width.
 export function split(left: View, right: View, st: SplitState): View {
   return { kind: "split", st, left, right }
+}
+
+// Accessibility label/role on a region; VoiceOver reads it and AXPress
+// routes to the region's click handler.
+export function ax(child: View, role: string, label: string): View {
+  return on(child, { ax: { role, label } })
 }
 
 // Fills its box with a solid color behind the child.
@@ -293,7 +301,7 @@ export function place(v: View, box: Box, inout cmds: Cmd[], inout hits: Hit[], s
       }
       const th = textSize(v.title, 15.0, true).h
       cmds.push({ kind: "text", x: box.x, y: box.y + (box.h - th) / 2, w: box.w, h: th, s: v.title, size: 15.0, color: "#ffffff", bold: true })
-      hits.push(tagClip({ box, on: { click: v.onClick, focusable: true } }, clip))
+      hits.push(tagClip({ box, on: { click: v.onClick, focusable: true, ax: { role: "AXButton", label: v.title } } }, clip))
       break
     }
     case "events":
@@ -504,13 +512,25 @@ static NSColor *color(NSString *hex) {
 
 static double num(NSDictionary *d, NSString *k) { return [d[k] doubleValue]; }
 
+@interface AxEl : NSAccessibilityElement
+@property(nonatomic) int idx;
+@end
+@implementation AxEl
+- (BOOL)accessibilityPerformPress {
+  emitJSON(@{ @"event": @"axpress", @"i": @(self.idx) });
+  return YES;
+}
+@end
+
 @interface ListView : NSView
 @property(nonatomic, strong) NSArray *displayList;
+@property(nonatomic, strong) NSArray *axList;
 @end
 
 static ListView *gView;
 
 @implementation ListView
+@synthesize axList = _axList;
 - (void)drawRect:(NSRect)dirty {
   [[NSColor whiteColor] setFill];
   NSRectFill(dirty);
@@ -656,6 +676,23 @@ static int mods(NSEvent *e) {
   [super viewDidMoveToWindow];
   [self emitGeometry];
 }
+- (id)accessibilityHitTest:(NSPoint)p { return self; }
+- (NSArray *)accessibilityChildren {
+  NSMutableArray *out = [NSMutableArray array];
+  int i = 0;
+  for (NSDictionary *a in self.axList ?: @[]) {
+    AxEl *el = [[AxEl alloc] init];
+    el.idx = i++;
+    el.accessibilityParent = self;
+    el.accessibilityRole = a[@"role"] ?: @"AXGroup";
+    el.accessibilityLabel = a[@"label"] ?: @"";
+    el.accessibilityFrameInParentSpace =
+      NSMakeRect(num(a, @"x"), num(a, @"y"), num(a, @"w"), num(a, @"h"));
+    el.accessibilityFocused = [a[@"focused"] boolValue];
+    [out addObject:el];
+  }
+  return out;
+}
 - (void)viewDidChangeBackingProperties {
   [super viewDidChangeBackingProperties];
   [self emitGeometry];
@@ -708,8 +745,13 @@ int main(int argc, const char *argv[]) {
         NSArray *frame = msg[@"frame"];
         if (frame) {
           NSArray *damage = msg[@"damage"];
+          NSArray *ax = msg[@"ax"];
           dispatch_async(dispatch_get_main_queue(), ^{
             gView.displayList = frame;
+            if (ax) {
+              gView.axList = ax;
+              NSAccessibilityPostNotification(gView, NSAccessibilityLayoutChangedNotification);
+            }
             if (damage) {
               for (NSDictionary *d in damage) {
                 [gView setNeedsDisplayInRect:NSMakeRect(num(d, @"x"), num(d, @"y"), num(d, @"w"), num(d, @"h"))];
@@ -841,6 +883,7 @@ type Ev = {
   id?: int, scale?: f64,
   key?: string, code?: int, mods?: int, repeat?: bool,
   s?: string,
+  i?: int,
 }
 
 export const MOD_CMD = 1
@@ -1088,6 +1131,14 @@ export class Window {
         }
         return false
       }
+      case "axpress": {
+        const i = ev.i ?? -1
+        if (i >= 0 && i < this.hits.length) {
+          const click = this.hits[i]!.on.click
+          if (click !== undefined) click()
+        }
+        return false
+      }
       case "focus":
         this.key = true
         return false
@@ -1182,7 +1233,17 @@ export class Window {
       const damage = damageRects(this.lastCmds, l.frame.frame)
       this.lastCmds = l.frame.frame
       this.lastFrame = json
-      try this.stdin!.write(JSON.stringify({ frame: l.frame.frame, damage }) + "\n")
+      // AX elements mirror the hit list: ax entries carry the hit index so
+      // axpress routes back, and the helper builds an element per entry.
+      let axs: { i: int, x: f64, y: f64, w: f64, h: f64, role: string, label: string, focused: bool }[] = []
+      for (let i = 0; i < l.hits.length; i += 1) {
+        const h = l.hits[i]!
+        const a = h.on.ax
+        if (a !== undefined) {
+          axs.push({ i, x: h.box.x, y: h.box.y, w: h.box.w, h: h.box.h, role: a.role, label: a.label, focused: i === this.focus })
+        }
+      }
+      try this.stdin!.write(JSON.stringify({ frame: l.frame.frame, damage, ax: axs }) + "\n")
     }
   }
 }
