@@ -1,4 +1,4 @@
-import { button, column, newWindow, pad, run, spacer, text } from "../../src/mytov"
+import { button, column, newWindow, onDeepLink, onOpenFile, pad, run, spacer, text } from "../../src/mytov"
 import type { View } from "../../src/mytov"
 
 class Counter {
@@ -35,5 +35,7 @@ function about(): View {
   )
 }
 
+onDeepLink((url) => console.log(`deeplink: ${url}`))
+onOpenFile((p) => console.log(`openfile: ${p}`))
 try run({ title: "Counter", width: 480, height: 360, view })
 try newWindow({ title: "About", width: 300, height: 220, view: about })

@@ -483,17 +483,22 @@ export function layout(v: View, w: f64, h: f64, st?: Styles): { frame: Frame, hi
 
 const HELPER_SRC = `#import <Cocoa/Cocoa.h>\n#import <UserNotifications/UserNotifications.h>
 
+// In host mode (packaged .app) these point at the backend child's pipes;
+// in window mode they are plain stdio.
+static FILE *gIn;
+static FILE *gOut;
+
 static void emit(const char *s) {
-  fputs(s, stdout);
-  fputc('\\n', stdout);
-  fflush(stdout);
+  fputs(s, gOut);
+  fputc('\\n', gOut);
+  fflush(gOut);
 }
 
 static void emitJSON(NSDictionary *d) {
   NSData *data = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
-  fwrite(data.bytes, 1, data.length, stdout);
-  fputc('\\n', stdout);
-  fflush(stdout);
+  fwrite(data.bytes, 1, data.length, gOut);
+  fputc('\\n', gOut);
+  fflush(gOut);
 }
 
 static NSFont *fontFor(NSDictionary *d) {
@@ -755,6 +760,59 @@ static void buildMenus(NSArray *menus, NSString *appName) {
   NSApp.mainMenu = main;
 }
 
+// file:// URLs are document opens, not deep links — open(1) delivers file
+// arguments to apps as GURL events with file URLs.
+static void emitURLOpen(NSString *s) {
+  NSURL *u = [NSURL URLWithString:s ?: @""];
+  if (u.isFileURL) {
+    emitJSON(@{ @"event": @"openfile", @"s": u.path ?: @"" });
+  } else {
+    emitJSON(@{ @"event": @"deeplink", @"s": s ?: @"" });
+  }
+}
+
+// AppKit presents argv tail entries to a launched app as documents to
+// open. Window helpers are spawned as "mytov-helper <title> <w> <h>", so
+// the first argc-1 openFiles: entries are launch noise — count and skip
+// them; a genuine odoc still arrives later.
+static int gSkipFiles = 0;
+
+@interface AppleEvents : NSObject <NSApplicationDelegate>
+@end
+@implementation AppleEvents
+- (void)handleGetURL:(NSAppleEventDescriptor *)e withReplyEvent:(NSAppleEventDescriptor *)r {
+  emitURLOpen([e paramDescriptorForKeyword:keyDirectObject].stringValue);
+}
+// Document opens reach the app two ways: AppKit intercepts the odoc Apple
+// Event and calls these delegate methods, and a raw odoc can still arrive
+// through the event manager (e.g. before AppKit is up). Cover both.
+- (void)application:(NSApplication *)app openFiles:(NSArray<NSString *> *)files {
+  for (NSString *f in files) {
+    if (gSkipFiles > 0) { gSkipFiles--; continue; }
+    emitJSON(@{ @"event": @"openfile", @"s": f });
+  }
+  [app replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
+}
+- (void)application:(NSApplication *)app openURLs:(NSArray<NSURL *> *)urls {
+  for (NSURL *u in urls) emitURLOpen(u.absoluteString);
+}
+- (void)handleOpenDocs:(NSAppleEventDescriptor *)e withReplyEvent:(NSAppleEventDescriptor *)r {
+  // The direct object is normally a list of file descriptors, but senders
+  // may pass a single one. fileURLValue covers typeFileURL, alias, and
+  // FSRef. An exception here would lose the event AND block the reply, so
+  // the body is guarded.
+  @try {
+    NSAppleEventDescriptor *docs = [e paramDescriptorForKeyword:keyDirectObject];
+    const bool isList = [docs descriptorType] == typeAEList;
+    NSInteger n = isList ? docs.numberOfItems : 1;
+    for (NSInteger i = 1; i <= n; i++) {
+      NSAppleEventDescriptor *d = isList ? [docs descriptorAtIndex:i] : docs;
+      emitJSON(@{ @"event": @"openfile", @"s": d.fileURLValue.path ?: @"" });
+    }
+  } @catch (NSException *x) {}
+}
+@end
+
 @interface Delegate : NSObject <NSWindowDelegate>
 @end
 @implementation Delegate
@@ -775,6 +833,64 @@ int main(int argc, const char *argv[]) {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
+    // Host mode: this process IS the .app. A sibling mytov-backend (or
+    // MYTOV_BACKEND env) is the Tov binary — launch it and relay: our
+    // events go to its stdin. No window here; windows come from helper
+    // processes the backend spawns. Window helpers are invoked with args
+    // (title w h), so only an arg-less launch with a backend sibling is a
+    // host — the packaged "mytov-helper" copy sits beside mytov-backend
+    // too and must not take this branch.
+    NSString *exe = NSBundle.mainBundle.executablePath ?: [NSString stringWithUTF8String:argv[0]];
+    const char *envBackend = getenv("MYTOV_BACKEND");
+    NSString *backend = envBackend ? @(envBackend) :
+      [[exe stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"mytov-backend"];
+    const bool hostMode = argc < 4 &&
+      [[NSFileManager defaultManager] fileExistsAtPath:backend];
+    if (hostMode) {
+      NSTask *t = [NSTask new];
+      t.executableURL = [NSURL fileURLWithPath:backend];
+      t.standardInput = [NSPipe pipe];
+      t.standardOutput = [NSPipe pipe];
+      NSMutableDictionary *env = [NSProcessInfo.processInfo.environment mutableCopy];
+      env[@"MYTOV_HOST"] = @"1";
+      t.environment = env;
+      [t launchAndReturnError:nil];
+      gIn = fdopen(dup([[t.standardOutput fileHandleForReading] fileDescriptor]), "r");
+      gOut = fdopen(dup([[t.standardInput fileHandleForWriting] fileDescriptor]), "w");
+      t.terminationHandler = ^(NSTask *task) { exit(0); };
+      // The backend's stdout carries no commands in host mode, but it must
+      // be drained or console.log output would fill the pipe and block the
+      // backend. Mirror it to our stderr so it's visible when the app is
+      // run from a terminal.
+      [NSThread detachNewThreadWithBlock:^{
+        char *line = NULL;
+        size_t cap = 0;
+        while (getline(&line, &cap, gIn) > 0) fputs(line, stderr);
+      }];
+    } else {
+      gIn = stdin;
+      gOut = stdout;
+    }
+
+    // Deep links (myapp://...) and file opens (dock drop, Finder open)
+    // arrive as Apple Events; the helper forwards them to Tov. Registered
+    // in host mode too — that's the whole point of the launcher layout.
+    static AppleEvents *gAppleEvents;
+    gAppleEvents = [AppleEvents new];
+    [[NSAppleEventManager sharedAppleEventManager]
+      setEventHandler:gAppleEvents
+          andSelector:@selector(handleGetURL:withReplyEvent:)
+        forEventClass:kInternetEventClass andEventID:kAEGetURL];
+    [[NSAppleEventManager sharedAppleEventManager]
+      setEventHandler:gAppleEvents
+          andSelector:@selector(handleOpenDocs:withReplyEvent:)
+        forEventClass:kCoreEventClass andEventID:kAEOpenDocuments];
+    // AppKit routes odoc/GURL to the app delegate as well.
+    gSkipFiles = argc > 1 ? argc - 1 : 0;
+    NSApp.delegate = gAppleEvents;
+    gMenuTarget = [MenuTarget new];
+
+    if (!hostMode) {
     NSWindow *win = [[NSWindow alloc]
       initWithContentRect:NSMakeRect(0, 0, w, h)
       styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -794,7 +910,7 @@ int main(int argc, const char *argv[]) {
     [NSThread detachNewThreadWithBlock:^{
       char *line = NULL;
       size_t cap = 0;
-      while (getline(&line, &cap, stdin) > 0) {
+      while (getline(&line, &cap, gIn) > 0) {
         NSData *d = [NSData dataWithBytes:line length:strlen(line)];
         NSDictionary *msg = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
         NSArray *frame = msg[@"frame"];
@@ -946,6 +1062,7 @@ int main(int argc, const char *argv[]) {
     // re-announce geometry once the run loop is up.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ [gView emitGeometry]; });
+    }
     [NSApp run];
   }
   return 0;
@@ -1293,6 +1410,10 @@ export class Window {
         }
         return false
       }
+      case "deeplink":
+      case "openfile":
+        dispatchAppEvent(ev)
+        return false
       case "menu": {
         const i = ev.i ?? -1
         const action = menuActions.get(i)
@@ -1433,6 +1554,7 @@ function resolveMeasure(ev: Ev) {
 // Open a window. `view` is re-rendered after every input event; the frame
 // is sent only when it changed, with damage rects for partial repaint.
 export function newWindow(opts: WindowOptions): Window throws Error | JsError {
+  try startHostChannel()
   const win = new Window(opts)
   try win.open()
   windows.push(win)
@@ -1481,6 +1603,57 @@ export function notify(title: string, body: string) throws Error {
   const win = activeWindow ?? windows[0]
   if (win === undefined) return
   try win.stdin!.write(`{"notify":{"title":${JSON.stringify(title)},"body":${JSON.stringify(body)}}}\n`)
+}
+
+// --- deep links ---------------------------------------------------------
+
+let deepLinkHandler: (url: string) => void = (url) => {}
+let openFileHandler: (path: string) => void = (path) => {}
+
+// Called when the app is asked to open a URL (myapp://...) or a file.
+export function onDeepLink(cb: (url: string) => void) { deepLinkHandler = cb }
+export function onOpenFile(cb: (path: string) => void) { openFileHandler = cb }
+
+// --- host channel ---------------------------------------------------------
+
+// App-level events shared by Window.dispatch and the host channel.
+// Returns true when the event was consumed here.
+function dispatchAppEvent(ev: Ev): bool {
+  switch (ev.event) {
+    case "deeplink":
+      deepLinkHandler(ev.s ?? "")
+      return true
+    case "openfile":
+      openFileHandler(ev.s ?? "")
+      return true
+  }
+  return false
+}
+
+// In a packaged .app the bundle executable is a helper in host mode: it
+// owns NSApplication and forwards app-level events (deep links, document
+// opens) as JSON lines to this process's stdin, flagging the layout with
+// MYTOV_HOST. Tov exposes no stdin stream, so the pipe is bounced through
+// `cat` — cat inherits our stdin and its stdout is a stream readline can
+// consume, the same channel shape windows use.
+let hostChannelStarted = false
+
+function startHostChannel() throws Error | JsError {
+  if (hostChannelStarted || process.env.MYTOV_HOST === undefined) return
+  hostChannelStarted = true
+  const args: string[] = []
+  const cat = try spawn("cat", args, { stdio: ["inherit", "pipe", "inherit"] })
+  const rl = try createInterface({ input: cat.stdout })
+  try rl.on("line", (line: Js) => {
+    try {
+      const ev = try JSON.parse(line as string) as Ev
+      if (dispatchAppEvent(ev)) return
+      const w = windows[0]
+      if (w !== undefined && w.dispatch(ev)) w.render()
+    } catch (e) {
+      console.error(`mytov: ${e.message}`)
+    }
+  })
 }
 
 // --- menus --------------------------------------------------------------
